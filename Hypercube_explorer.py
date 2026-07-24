@@ -7,6 +7,15 @@ Created on Thu Aug 14 22:45:33 2025
 
 # Step-by-step LIBS hypercube processing: Load, Photo, Mask, Normalize, Map Explorer, Data Extraction, Composite, Export
 
+import os
+
+# joblib/loky (used by scikit-learn) counts physical cores via 'wmic', which
+# was removed from recent Windows builds; without this it prints a warning +
+# traceback on every use. Must be set before joblib is first imported, and must
+# be strictly below the logical core count for loky to respect it (which also
+# leaves one core free for the UI during heavy computations).
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(max(1, (os.cpu_count() or 2) - 1)))
+
 import sys
 import numpy as np
 import xarray as xr
@@ -16,7 +25,7 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.gridspec import GridSpec
 
-import os, json
+import json
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -33,7 +42,7 @@ from PyQt5.QtWidgets import (
 )
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QLinearGradient, QPen, QPolygonF, QPainterPath, QImage
+from PyQt5.QtGui import QPixmap, QPainter, QColor, QFont, QLinearGradient, QPen, QPolygonF, QPainterPath, QImage, QIcon
 from PyQt5.QtCore import QPointF, QEvent
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QAction, QMenuBar, QStatusBar,
@@ -41,7 +50,8 @@ from PyQt5.QtWidgets import (
     QLabel, QComboBox, QSlider, QDoubleSpinBox, QSpinBox,
     QCheckBox, QToolButton, QPushButton, QGroupBox, QMessageBox,
     QDialog, QLineEdit, QDialogButtonBox, QTreeWidget, QTreeWidgetItem, QHeaderView, QSplashScreen,
-    QProgressDialog, QSplitter, QScrollArea, QMenu, QSizePolicy, QColorDialog, QRadioButton
+    QProgressDialog, QSplitter, QScrollArea, QMenu, QSizePolicy, QColorDialog, QRadioButton,
+    QStyle
 )
 
 import pandas as pd
@@ -53,7 +63,7 @@ class _NormCancelled(Exception):
 
 # ---- App constants ----
 APP_NAME = "LIBS hypercube explorer"
-BUILD_VERSION = "2026-04-02 17:00"
+BUILD_VERSION = "2026-07-24 19:18"
 
 # ---- Matplotlib defaults ----
 plt.rcParams.update({
@@ -993,6 +1003,10 @@ class HypercubeExplorer(QMainWindow):
         self._bi_wavelengths = None
         self._bi_pixel = None
 
+        # Chemometrics (PCA/NMF/clustering) state
+        self.chem_result = None
+        self.chem_colorbar = None
+
         # ----- build UI -----
         self._build_menubar()
         self._build_central_ui()
@@ -1065,6 +1079,7 @@ class HypercubeExplorer(QMainWindow):
         self._build_tab_normalize()
         self._build_tab_mapexplorer()
         self._build_tab_extraction()
+        self._build_tab_chemometrics()
         self._build_tab_rgb()
         self._build_tab_export()
         self._build_tab_cube_utils()
@@ -1433,6 +1448,21 @@ class HypercubeExplorer(QMainWindow):
         self.norm_kernel_spin.setValue(21)
         fn.addRow("Kernel (px):", self.norm_kernel_spin)
 
+        self.norm_spectro_edit = QLineEdit()
+        self.norm_spectro_edit.setPlaceholderText("all — e.g. 1-3,5")
+        self.norm_spectro_edit.setToolTip(
+            "Restrict the channels used to compute the normalization statistics\n"
+            "(total emission / area, SNV mean & std, per-pixel max) to specific\n"
+            "spectrometers. The resulting factor is applied to the whole spectrum.\n"
+            "Syntax: '1-3', '1,3,5', 'all'. Detected ranges are listed below."
+        )
+        fn.addRow("Spectrometers:", self.norm_spectro_edit)
+
+        self.norm_spectro_info = QLabel("")
+        self.norm_spectro_info.setStyleSheet("color: #555; font-size: 8pt;")
+        self.norm_spectro_info.setWordWrap(True)
+        fn.addRow(self.norm_spectro_info)
+
         norm_btns = QHBoxLayout()
         self.norm_apply_btn = QPushButton("Apply")
         self.norm_save_btn = QPushButton("Save cube...")
@@ -1464,7 +1494,11 @@ class HypercubeExplorer(QMainWindow):
             "<b>Continuum</b> - Divide by mean of a featureless window<br>"
             "<b>SNV</b> - Subtract mean, divide by std per pixel<br>"
             "<b>Max-norm</b> - Divide each pixel by its maximum<br>"
-            "<b>Spatial median</b> - Divide each band by spatial median filter"
+            "<b>Spatial median</b> - Divide each band by spatial median filter<br><br>"
+            "<b>Spectrometers</b> - For TEN / TAN / SNV / Max-norm, the field restricts "
+            "which spectrometers are used to <i>compute</i> the normalization factor "
+            "(e.g. '1-3,5'); the factor is then applied to the whole spectrum. "
+            "Useful to exclude a noisy or saturated spectrometer."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #555; font-size: 9pt; padding: 8px; background: #f8f9fa; border: 1px solid #ddd; border-radius: 4px;")
@@ -2114,8 +2148,275 @@ class HypercubeExplorer(QMainWindow):
         outer.addWidget(self.science_splitter)
 
         self.tabs.addTab(self.tabExtraction, "6. Data Extraction")
-    
-    
+
+    # --- Chemometrics tab (PCA / NMF / clustering) ---
+    def _build_tab_chemometrics(self):
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+
+        self.tabChem = QWidget(self)
+        outer = QHBoxLayout(self.tabChem)
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(0)
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        # -------- LEFT: component / cluster map --------
+        map_widget = QWidget()
+        map_lay = QVBoxLayout(map_widget)
+        map_lay.setContentsMargins(0, 0, 4, 0)
+        map_lay.setSpacing(2)
+
+        lbl_map = QLabel("Component / cluster map")
+        lbl_map.setAlignment(Qt.AlignHCenter)
+        lbl_map.setObjectName("sectionLabel")
+        map_lay.addWidget(lbl_map)
+
+        self.chem_canvas = FigureCanvas(plt.Figure(dpi=100))
+        self.chem_ax = self.chem_canvas.figure.add_subplot(111)
+        # Scroll area so a tall multi-map grid can extend beyond the screen
+        self.chem_map_scroll = QScrollArea()
+        self.chem_map_scroll.setWidgetResizable(True)
+        self.chem_map_scroll.setFrameShape(QScrollArea.NoFrame)
+        self.chem_map_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.chem_map_scroll.setWidget(self.chem_canvas)
+        map_lay.addWidget(self.chem_map_scroll, stretch=1)
+        self.chem_toolbar = NavigationToolbar(self.chem_canvas, self)
+        map_lay.addWidget(self.chem_toolbar)
+
+        # -------- RIGHT: controls (top) + loadings plot (bottom) --------
+        right_widget = QWidget()
+        right = QVBoxLayout(right_widget)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(4)
+
+        ctrl_scroll = QScrollArea()
+        ctrl_scroll.setWidgetResizable(True)
+        ctrl_scroll.setFrameShape(QScrollArea.NoFrame)
+        ctrl_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        ctrl_inner = QWidget()
+        ctrl_lay = QVBoxLayout(ctrl_inner)
+        ctrl_lay.setContentsMargins(2, 2, 2, 2)
+        ctrl_lay.setSpacing(4)
+
+        # --- Group: Analysis setup ---
+        grpA = QGroupBox("Analysis")
+        fa = QFormLayout(grpA)
+        fa.setContentsMargins(6, 14, 6, 6)
+        fa.setSpacing(4)
+
+        self.chem_method_combo = QComboBox()
+        self.chem_method_combo.addItems(["PCA", "NMF", "K-Means clustering"])
+        self.chem_method_combo.setToolTip(
+            "PCA: orthogonal components, loadings show which peaks vary together (can be negative).\n"
+            "NMF: additive non-negative 'endmember-like' spectra, often easier to read chemically.\n"
+            "K-Means: hard segmentation into chemical domains; centroid spectra show what defines each domain."
+        )
+        fa.addRow("Method:", self.chem_method_combo)
+
+        self.chem_ncomp_spin = QSpinBox()
+        self.chem_ncomp_spin.setRange(2, 20)
+        self.chem_ncomp_spin.setValue(5)
+        fa.addRow("Components / clusters:", self.chem_ncomp_spin)
+
+        self.chem_wl_min_spin = QDoubleSpinBox()
+        self.chem_wl_min_spin.setDecimals(2); self.chem_wl_min_spin.setRange(0.0, 1e6)
+        self.chem_wl_min_spin.setValue(0.0)
+        fa.addRow("λ min (nm):", self.chem_wl_min_spin)
+
+        self.chem_wl_max_spin = QDoubleSpinBox()
+        self.chem_wl_max_spin.setDecimals(2); self.chem_wl_max_spin.setRange(0.0, 1e6)
+        self.chem_wl_max_spin.setValue(1e6)
+        fa.addRow("λ max (nm):", self.chem_wl_max_spin)
+
+        self.chem_spectro_edit = QLineEdit()
+        self.chem_spectro_edit.setPlaceholderText("all — e.g. 1-3,5")
+        self.chem_spectro_edit.setToolTip(
+            "Restrict the analysis to specific spectrometers (combined with the\n"
+            "λ range above). Syntax: '1-3', '1,3,5', 'all'.\n"
+            "Detected ranges are listed below."
+        )
+        fa.addRow("Spectrometers:", self.chem_spectro_edit)
+
+        self.chem_spectro_info = QLabel("")
+        self.chem_spectro_info.setStyleSheet("color: #555; font-size: 8pt;")
+        self.chem_spectro_info.setWordWrap(True)
+        fa.addRow(self.chem_spectro_info)
+
+        self.chem_exclude_mask_cb = QCheckBox("Exclude masked pixels")
+        self.chem_exclude_mask_cb.setChecked(True)
+        fa.addRow(self.chem_exclude_mask_cb)
+
+        self.chem_standardize_cb = QCheckBox("Standardize bands (z-score)")
+        self.chem_standardize_cb.setToolTip(
+            "Scale each band to unit variance before PCA/K-Means so weak lines\n"
+            "can contribute as much as intense ones. Ignored for NMF."
+        )
+        fa.addRow(self.chem_standardize_cb)
+
+        self.chem_max_fit_spin = QSpinBox()
+        self.chem_max_fit_spin.setRange(1000, 10_000_000)
+        self.chem_max_fit_spin.setSingleStep(10000)
+        self.chem_max_fit_spin.setValue(50000)
+        self.chem_max_fit_spin.setToolTip(
+            "Model is fitted on a random subset of at most this many pixels\n"
+            "(then applied to all pixels). Lower = faster on large maps."
+        )
+        fa.addRow("Max pixels for fit:", self.chem_max_fit_spin)
+
+        self.chem_run_btn = QPushButton("Run analysis")
+        self.chem_run_btn.setStyleSheet(self._CHEM_BTN_STYLE_IDLE)
+        fa.addRow(self.chem_run_btn)
+
+        sil_row = QHBoxLayout()
+        self.chem_kmax_spin = QSpinBox()
+        self.chem_kmax_spin.setRange(3, 20)
+        self.chem_kmax_spin.setValue(10)
+        self.chem_kmax_spin.setToolTip("Largest cluster count tested by the silhouette scan (k = 2 … this value)")
+        sil_row.addWidget(QLabel("k ≤"))
+        sil_row.addWidget(self.chem_kmax_spin)
+        self.chem_sil_btn = QPushButton("Silhouette scan (suggest k)")
+        self.chem_sil_btn.setToolTip(
+            "Run K-Means for k = 2 … k max and score each clustering with the\n"
+            "mean silhouette coefficient (computed on a pixel subsample).\n"
+            "The k with the highest score is the suggested number of chemical domains.\n"
+            "Results appear in the 'Silhouette' plot tab."
+        )
+        sil_row.addWidget(self.chem_sil_btn, stretch=1)
+        fa.addRow("Suggest clusters:", sil_row)
+
+        self.chem_status_label = QLabel("No analysis run yet.")
+        self.chem_status_label.setStyleSheet("color: #555; font-size: 8pt;")
+        self.chem_status_label.setWordWrap(True)
+        fa.addRow(self.chem_status_label)
+
+        ctrl_lay.addWidget(grpA)
+
+        # --- Group: Results ---
+        grpR = QGroupBox("Results")
+        fr = QFormLayout(grpR)
+        fr.setContentsMargins(6, 14, 6, 6)
+        fr.setSpacing(4)
+
+        self.chem_comp_combo = QComboBox()
+        fr.addRow("Component:", self.chem_comp_combo)
+
+        self.chem_grid_cb = QCheckBox("Show all component maps (grid)")
+        self.chem_grid_cb.setToolTip(
+            "Display every component map at once in a 2-column grid\n"
+            "(PCA/NMF only). Click a map to select that component.\n"
+            "Scroll the map panel if the grid is taller than the window."
+        )
+        fr.addRow(self.chem_grid_cb)
+
+        self.chem_npeaks_spin = QSpinBox()
+        self.chem_npeaks_spin.setRange(0, 30)
+        self.chem_npeaks_spin.setValue(8)
+        self.chem_npeaks_spin.setToolTip("Number of strongest peaks to label on the loading spectrum")
+        fr.addRow("Peaks to label:", self.chem_npeaks_spin)
+
+        self.chem_peaks_label = QLabel("Top peaks: —")
+        self.chem_peaks_label.setStyleSheet("color: #2c3e50; font-size: 8pt;")
+        self.chem_peaks_label.setWordWrap(True)
+        self.chem_peaks_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        fr.addRow(self.chem_peaks_label)
+
+        self.chem_export_btn = QPushButton("Save component spectra (CSV)")
+        fr.addRow(self.chem_export_btn)
+
+        ctrl_lay.addWidget(grpR)
+        ctrl_lay.addStretch()
+        ctrl_scroll.setWidget(ctrl_inner)
+
+        # -- Plot area: tabbed (Loadings | Score scatter) --
+        self.chem_plot_tabs = QTabWidget()
+
+        # Tab 1: loadings / centroid plot
+        plot_widget = QWidget()
+        plot_lay = QVBoxLayout(plot_widget)
+        plot_lay.setContentsMargins(0, 0, 0, 0)
+        plot_lay.setSpacing(2)
+        self.chem_plot_canvas = FigureCanvas(plt.Figure(dpi=100))
+        self.chem_plot_ax = self.chem_plot_canvas.figure.add_subplot(111)
+        plot_lay.addWidget(self.chem_plot_canvas, stretch=1)
+        self.chem_plot_toolbar = NavigationToolbar(self.chem_plot_canvas, self)
+        plot_lay.addWidget(self.chem_plot_toolbar)
+        self.chem_plot_tabs.addTab(plot_widget, "Loadings / centroids")
+
+        # Tab 2: user-defined component-vs-component scatter
+        scatter_widget = QWidget()
+        scatter_lay = QVBoxLayout(scatter_widget)
+        scatter_lay.setContentsMargins(0, 0, 0, 0)
+        scatter_lay.setSpacing(2)
+
+        sc_row = QHBoxLayout()
+        sc_row.setContentsMargins(4, 2, 4, 0)
+        sc_row.addWidget(QLabel("X:"))
+        self.chem_scatter_x_combo = QComboBox()
+        sc_row.addWidget(self.chem_scatter_x_combo, stretch=1)
+        sc_row.addWidget(QLabel("Y:"))
+        self.chem_scatter_y_combo = QComboBox()
+        sc_row.addWidget(self.chem_scatter_y_combo, stretch=1)
+        scatter_lay.addLayout(sc_row)
+
+        self.chem_scatter_canvas = FigureCanvas(plt.Figure(dpi=100))
+        self.chem_scatter_ax = self.chem_scatter_canvas.figure.add_subplot(111)
+        scatter_lay.addWidget(self.chem_scatter_canvas, stretch=1)
+        self.chem_scatter_toolbar = NavigationToolbar(self.chem_scatter_canvas, self)
+        scatter_lay.addWidget(self.chem_scatter_toolbar)
+        self.chem_plot_tabs.addTab(scatter_widget, "Score scatter")
+
+        # Tab 3: silhouette scan (K-Means cluster-count suggestion)
+        sil_widget = QWidget()
+        sil_lay = QVBoxLayout(sil_widget)
+        sil_lay.setContentsMargins(0, 0, 0, 0)
+        sil_lay.setSpacing(2)
+        self.chem_sil_canvas = FigureCanvas(plt.Figure(dpi=100))
+        sil_lay.addWidget(self.chem_sil_canvas, stretch=1)
+        self.chem_sil_toolbar = NavigationToolbar(self.chem_sil_canvas, self)
+        sil_lay.addWidget(self.chem_sil_toolbar)
+        self.chem_plot_tabs.addTab(sil_widget, "Silhouette")
+
+        right_vsplit = QSplitter(Qt.Vertical)
+        right_vsplit.setChildrenCollapsible(False)
+        right_vsplit.addWidget(ctrl_scroll)
+        right_vsplit.addWidget(self.chem_plot_tabs)
+        right_vsplit.setSizes([320, 430])
+        right.addWidget(right_vsplit)
+
+        splitter.addWidget(map_widget)
+        splitter.addWidget(right_widget)
+        splitter.setSizes([700, 650])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        outer.addWidget(splitter)
+
+        # Signals
+        self.chem_run_btn.clicked.connect(self._chem_run)
+        self.chem_comp_combo.currentIndexChanged.connect(self._chem_on_component_changed)
+        self.chem_npeaks_spin.valueChanged.connect(self._chem_on_component_changed)
+        self.chem_export_btn.clicked.connect(self._chem_export_spectra)
+        self.chem_grid_cb.toggled.connect(self._chem_update_map)
+        self.chem_scatter_x_combo.currentIndexChanged.connect(self._chem_update_scatter)
+        self.chem_scatter_y_combo.currentIndexChanged.connect(self._chem_update_scatter)
+        self.chem_canvas.mpl_connect('button_press_event', self._chem_on_map_click)
+        self.chem_sil_btn.clicked.connect(self._chem_silhouette_scan)
+
+        # Icons (drawn in code; standard style icons for the action buttons)
+        style = self.style()
+        self.chem_method_combo.setItemIcon(0, self._chem_icon('pca'))
+        self.chem_method_combo.setItemIcon(1, self._chem_icon('nmf'))
+        self.chem_method_combo.setItemIcon(2, self._chem_icon('kmeans'))
+        self.chem_run_btn.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
+        self.chem_sil_btn.setIcon(style.standardIcon(QStyle.SP_MessageBoxQuestion))
+        self.chem_export_btn.setIcon(style.standardIcon(QStyle.SP_DialogSaveButton))
+        self.chem_plot_tabs.setTabIcon(0, self._chem_icon('spectrum'))
+        self.chem_plot_tabs.setTabIcon(1, self._chem_icon('scatter'))
+        self.chem_plot_tabs.setTabIcon(2, self._chem_icon('silhouette'))
+
+        self.tabs.addTab(self.tabChem, "7. Chemometrics")
+
     # --- Composite Overlay tab ---
     def _build_tab_rgb(self):
         from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -2391,7 +2692,7 @@ class HypercubeExplorer(QMainWindow):
         right.addWidget(self.comp_info_label)
 
         outer.addLayout(right, stretch=3)
-        self.tabs.addTab(self.tabRGB, "7. Composite")
+        self.tabs.addTab(self.tabRGB, "8. Composite")
 
     # -- Composite helpers --
 
@@ -2958,7 +3259,7 @@ class HypercubeExplorer(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         outer.addWidget(splitter)
-        self.tabs.addTab(self.tabExport, "8. Cube subset")
+        self.tabs.addTab(self.tabExport, "9. Cube subset")
 
     # --- Cube Utils tab ---
     def _build_tab_cube_utils(self):
@@ -3154,7 +3455,7 @@ class HypercubeExplorer(QMainWindow):
         outer.addWidget(grpSave)
         outer.addStretch()
 
-        self.tabs.addTab(self.tabCubeUtils, "9. Cube utils")
+        self.tabs.addTab(self.tabCubeUtils, "10. Cube utils")
 
     # ====== Cube Utils logic ======
     def _cubeutils_on_tab_changed(self, index):
@@ -3486,6 +3787,15 @@ class HypercubeExplorer(QMainWindow):
             prog.close()
             QMessageBox.critical(self, "Cube Utils", f"Could not remove channels:\n{e}")
             return
+
+        # Keep global metadata consistent with the new band axis (provenance
+        # for cubes saved via 'Save re-encoded cube').
+        if "bands_total" in self.original_ds.attrs:
+            self.original_ds.attrs["bands_total"] = len(keep_idx)
+        prev_removed = str(self.original_ds.attrs.get("channels_removed", "")).strip()
+        removal_note = (f"{start0 + 1}-{stop0} ({wl_from:.3f}-{wl_to:.3f} nm)")
+        self.original_ds.attrs["channels_removed"] = (
+            f"{prev_removed}; {removal_note}" if prev_removed else removal_note)
 
         prog.setLabelText("Rebuilding working dataset…")
         prog.setValue(2)
@@ -4319,6 +4629,145 @@ class HypercubeExplorer(QMainWindow):
             return None
         return np.asarray(target.coords['bands'].values, dtype=float)
 
+    # ====== Spectrometer segments (multi-spectrometer cubes) ======
+    def _read_device_groups(self):
+        """Best-effort read of the 'devices' groups from the NetCDF file."""
+        if not self.loaded_cube_path:
+            return []
+        try:
+            import netCDF4  # optional dependency
+            with netCDF4.Dataset(self.loaded_cube_path, "r") as nc:
+                if "devices" not in nc.groups:
+                    return []
+                devs = nc.groups["devices"]
+                return [{'name': n, 'attrs': dict(devs.groups[n].__dict__)}
+                        for n in sorted(devs.groups.keys())]
+        except Exception:
+            return []
+
+    def _get_spectrometer_segments(self):
+        """Split the band axis into per-spectrometer segments.
+
+        Primary detection uses the wavelength axis itself: in a stitched
+        multi-spectrometer cube the wavelength restarts at a lower value at
+        each spectrometer boundary (works even for old cubes without device
+        metadata). If the axis is monotonic, per-device channel counts from
+        the NetCDF 'devices' metadata are used as a fallback.
+
+        Returns a list of dicts {'name', 'i0', 'i1', 'wl0', 'wl1'} in band
+        order (i0/i1 are inclusive band indices).
+        """
+        bands = self._get_bands_values(warn=False)
+        if bands is None or bands.size == 0:
+            return []
+        n = int(bands.size)
+        starts = [0] + [i for i in range(1, n) if bands[i] <= bands[i - 1]]
+        segs = []
+        for j, s in enumerate(starts):
+            e = (starts[j + 1] - 1) if j + 1 < len(starts) else n - 1
+            segs.append({'i0': int(s), 'i1': int(e),
+                         'wl0': float(bands[s]), 'wl1': float(bands[e])})
+
+        devices = self._read_device_groups()
+        if len(segs) == 1 and len(devices) > 1:
+            # Monotonic axis (e.g. re-sorted cube): try per-device channel counts.
+            counts = []
+            for d in devices:
+                cnt = None
+                for k, v in d['attrs'].items():
+                    kl = k.lower()
+                    if any(t in kl for t in ('bands', 'channels', 'points', 'pixels')):
+                        try:
+                            iv = int(np.asarray(v).ravel()[0])
+                            if iv > 1:
+                                cnt = iv
+                                break
+                        except Exception:
+                            pass
+                counts.append(cnt)
+            if all(c is not None for c in counts) and sum(counts) == n:
+                segs = []
+                off = 0
+                for c in counts:
+                    segs.append({'i0': off, 'i1': off + c - 1,
+                                 'wl0': float(bands[off]), 'wl1': float(bands[off + c - 1])})
+                    off += c
+
+        names = [d['name'] for d in devices] if len(devices) == len(segs) else [None] * len(segs)
+        for s, nm in zip(segs, names):
+            s['name'] = nm
+        return segs
+
+    @staticmethod
+    def _parse_spectro_selection(text, n_seg):
+        """Parse a '1-3,5' style spectrometer selection into 0-based indices.
+
+        Accepts commas/semicolons/spaces as separators and '-' or ':' for
+        ranges. Empty text or 'all' selects every spectrometer.
+        """
+        text = (text or "").strip()
+        if not text or text.lower() in ('all', '*'):
+            return list(range(n_seg))
+        picked = set()
+        for token in text.replace(';', ',').replace(' ', ',').split(','):
+            token = token.strip()
+            if not token:
+                continue
+            sep = '-' if '-' in token else (':' if ':' in token else None)
+            try:
+                if sep:
+                    a, b = token.split(sep, 1)
+                    a, b = int(a), int(b)
+                    if a > b:
+                        a, b = b, a
+                    values = range(a, b + 1)
+                else:
+                    values = [int(token)]
+            except ValueError:
+                raise ValueError(
+                    f"Could not parse spectrometer selection '{token}'.\n"
+                    "Use e.g. '1-3', '1,3,5' or 'all'.")
+            for v in values:
+                if not (1 <= v <= n_seg):
+                    raise ValueError(f"Spectrometer {v} is out of range (1–{n_seg}).")
+                picked.add(v - 1)
+        if not picked:
+            raise ValueError("Empty spectrometer selection.")
+        return sorted(picked)
+
+    def _spectro_selected_band_indices(self, text):
+        """Band indices covered by the spectrometer selection, or None for 'all'.
+
+        Raises ValueError for an invalid selection string."""
+        segs = self._get_spectrometer_segments()
+        if not segs:
+            return None
+        sel = self._parse_spectro_selection(text, len(segs))
+        if len(sel) == len(segs):
+            return None
+        return np.concatenate([np.arange(segs[i]['i0'], segs[i]['i1'] + 1)
+                               for i in sel]).astype(int)
+
+    def _spectro_info_text(self):
+        segs = self._get_spectrometer_segments()
+        if not segs:
+            return ""
+        if len(segs) == 1:
+            return "Single spectrometer detected — selection has no effect."
+        parts = []
+        for i, s in enumerate(segs):
+            nm = f" ({s['name']})" if s.get('name') else ""
+            parts.append(f"{i+1}: {s['wl0']:.0f}–{s['wl1']:.0f} nm{nm}")
+        return f"{len(segs)} spectrometers detected — " + " | ".join(parts)
+
+    def _update_spectrometer_info(self):
+        """Refresh the spectrometer summary labels (Normalize + Chemometrics tabs)."""
+        txt = self._spectro_info_text()
+        if hasattr(self, 'norm_spectro_info'):
+            self.norm_spectro_info.setText(txt)
+        if hasattr(self, 'chem_spectro_info'):
+            self.chem_spectro_info.setText(txt)
+
     # ====== Help / About ======
     def _open_help(self):
         """Open the HTML user guide in the system default browser."""
@@ -4356,7 +4805,7 @@ class HypercubeExplorer(QMainWindow):
             "<b>Developed at:</b><br>"
             "RBINS-GSB<br>"
             "<b>Dependencies:</b> Python · PyQt5 · xarray · numpy<br>"
-            "matplotlib · scipy · pandas · Pillow"
+            "matplotlib · scipy · pandas · Pillow · scikit-learn"
         )
         info.setStyleSheet("font-size: 9pt; color: #00000; line-height: 1.6;")
         info.setWordWrap(True)
@@ -4408,6 +4857,9 @@ class HypercubeExplorer(QMainWindow):
             self.cube_baseline_combo.blockSignals(False)
             self._cube_baseline_on_method_changed()
             self.cube_bl_status_label.setText("")
+
+        # Reset chemometrics results (band range defaults to the new cube)
+        self._chem_reset()
 
         self.update_plot()
 
@@ -4920,10 +5372,13 @@ class HypercubeExplorer(QMainWindow):
         method = self.norm_combo.currentText()
         show_cont   = method == "Continuum window"
         show_kernel = method == "Spatial median filter"
+        show_spectro = method in ("Total Emission (TEN)", "Total Area (TAN)",
+                                  "SNV (Standard Normal Variate)", "Max-norm per pixel")
         for widget, enabled in [
             (self.norm_cont_start,  show_cont),
             (self.norm_cont_end,    show_cont),
             (self.norm_kernel_spin, show_kernel),
+            (self.norm_spectro_edit, show_spectro),
         ]:
             widget.setEnabled(enabled)
             lbl = self.norm_form.labelForField(widget)
@@ -4940,6 +5395,19 @@ class HypercubeExplorer(QMainWindow):
         if self.original_ds is None:
             return
         method = self.norm_combo.currentText()
+
+        # Validate the spectrometer selection up front (stats-based methods only)
+        spectro_note = ""
+        if method in ("Total Emission (TEN)", "Total Area (TAN)",
+                      "SNV (Standard Normal Variate)", "Max-norm per pixel"):
+            try:
+                idx = self._spectro_selected_band_indices(self.norm_spectro_edit.text())
+                if idx is not None:
+                    spectro_note = f" (spectros {self.norm_spectro_edit.text().strip()})"
+            except ValueError as e:
+                QMessageBox.warning(self, "Normalization", str(e))
+                return
+
         self.norm_status_label.setText("Computing…")
         QApplication.processEvents()
 
@@ -4955,19 +5423,19 @@ class HypercubeExplorer(QMainWindow):
                 self.norm_status_label.setText("")
             elif method == "Total Emission (TEN)":
                 self.ds = self._norm_ten()
-                self.norm_status_label.setText("TEN applied")
+                self.norm_status_label.setText("TEN applied" + spectro_note)
             elif method == "Total Area (TAN)":
                 self.ds = self._norm_tan()
-                self.norm_status_label.setText("TAN applied")
+                self.norm_status_label.setText("TAN applied" + spectro_note)
             elif method == "Continuum window":
                 self.ds = self._norm_continuum()
                 self.norm_status_label.setText("Continuum norm applied")
             elif method == "SNV (Standard Normal Variate)":
                 self.ds = self._norm_snv()
-                self.norm_status_label.setText("SNV applied")
+                self.norm_status_label.setText("SNV applied" + spectro_note)
             elif method == "Max-norm per pixel":
                 self.ds = self._norm_max()
-                self.norm_status_label.setText("Max-norm applied")
+                self.norm_status_label.setText("Max-norm applied" + spectro_note)
             elif method == "Spatial median filter":
                 self.ds = self._norm_spatial_median()
                 self.norm_status_label.setText("Spatial median applied")
@@ -5028,6 +5496,10 @@ class HypercubeExplorer(QMainWindow):
                 ds_out.attrs["normalization_cont_end_nm"] = float(self.norm_cont_end.value())
             elif method == "Spatial median filter":
                 ds_out.attrs["normalization_kernel_px"] = int(self.norm_kernel_spin.value())
+            spectro_txt = self.norm_spectro_edit.text().strip()
+            if spectro_txt and method in ("Total Emission (TEN)", "Total Area (TAN)",
+                                          "SNV (Standard Normal Variate)", "Max-norm per pixel"):
+                ds_out.attrs["normalization_spectrometers"] = spectro_txt
             if self.loaded_cube_path:
                 ds_out.attrs["normalization_source_file"] = os.path.basename(self.loaded_cube_path)
             prog.setValue(1); QApplication.processEvents()
@@ -5080,6 +5552,18 @@ class HypercubeExplorer(QMainWindow):
         """Read band *i* from a DataArray as a 2D float32 array (lazy-safe)."""
         return np.asarray(ref.isel(bands=i).values, dtype=np.float32)
 
+    def _norm_stat_indices(self, n_bands):
+        """Band indices used to compute the normalization statistics.
+
+        Restricted to the spectrometers selected in the Normalize tab
+        (the normalization factor is still applied to all bands).
+        Raises ValueError for an invalid selection string."""
+        text = self.norm_spectro_edit.text() if hasattr(self, 'norm_spectro_edit') else ""
+        idx = self._spectro_selected_band_indices(text)
+        if idx is None:
+            return np.arange(n_bands, dtype=int)
+        return idx
+
     def _norm_write_band(self, output, bands_ax, i, data):
         """Write a 2D array into band *i* of the pre-allocated output cube."""
         idx = [slice(None)] * output.ndim
@@ -5097,18 +5581,20 @@ class HypercubeExplorer(QMainWindow):
     # --- TEN: divide each pixel spectrum by its total emission ---
     def _norm_ten(self):
         var_name, ref, n_bands, bands_ax = self._norm_var_and_meta()
+        stat_idx = self._norm_stat_indices(n_bands)
+        n_stat = len(stat_idx)
         lbl1 = "TEN — pass 1/2: computing sum"
-        prog = self._make_norm_progress(lbl1, n_bands)
+        prog = self._make_norm_progress(lbl1, n_stat)
 
-        band0 = self._norm_read_band(ref, 0)
+        band0 = self._norm_read_band(ref, int(stat_idx[0]))
         spatial_shape = band0.shape
         total = np.zeros(spatial_shape, dtype=np.float64)
 
-        for i in range(n_bands):
-            band = self._norm_read_band(ref, i) if i > 0 else band0
+        for step, i in enumerate(stat_idx):
+            band = self._norm_read_band(ref, int(i)) if step > 0 else band0
             np.add(total, np.where(np.isnan(band), 0.0, band), out=total)
-            if self._norm_should_update(i, n_bands):
-                self._norm_progress_update(prog, lbl1, i, n_bands)
+            if self._norm_should_update(step, n_stat):
+                self._norm_progress_update(prog, lbl1, step, n_stat)
         del band0
 
         total[total == 0] = 1.0
@@ -5131,22 +5617,30 @@ class HypercubeExplorer(QMainWindow):
     def _norm_tan(self):
         var_name, ref, n_bands, bands_ax = self._norm_var_and_meta()
         bands = np.asarray(self._get_bands_values(ds=self.original_ds), dtype=np.float64)
+        stat_idx = self._norm_stat_indices(n_bands)
+        n_stat = len(stat_idx)
         lbl1 = "TAN — pass 1/2: computing area"
-        prog = self._make_norm_progress(lbl1, n_bands)
+        prog = self._make_norm_progress(lbl1, n_stat)
 
-        band0 = self._norm_read_band(ref, 0)
+        band0 = self._norm_read_band(ref, int(stat_idx[0]))
         spatial_shape = band0.shape
         total_area = np.zeros(spatial_shape, dtype=np.float64)
+        prev_i = int(stat_idx[0])
         prev_band = np.where(np.isnan(band0), 0.0, band0.astype(np.float64))
 
-        for i in range(1, n_bands):
+        for step in range(1, n_stat):
+            i = int(stat_idx[step])
             cur = self._norm_read_band(ref, i)
             cur_clean = np.where(np.isnan(cur), 0.0, cur.astype(np.float64))
-            dwl = bands[i] - bands[i - 1]
-            total_area += 0.5 * dwl * (prev_band + cur_clean)
+            dwl = bands[i] - bands[prev_i]
+            # Integrate only within contiguous, increasing-wavelength runs
+            # (skips spectrometer boundaries and selection gaps).
+            if i == prev_i + 1 and dwl > 0:
+                total_area += 0.5 * dwl * (prev_band + cur_clean)
+            prev_i = i
             prev_band = cur_clean
-            if self._norm_should_update(i, n_bands):
-                self._norm_progress_update(prog, lbl1, i, n_bands)
+            if self._norm_should_update(step, n_stat):
+                self._norm_progress_update(prog, lbl1, step, n_stat)
         del prev_band
 
         total_area[total_area == 0] = 1.0
@@ -5216,24 +5710,26 @@ class HypercubeExplorer(QMainWindow):
     # --- SNV: per-pixel subtract mean, divide by std ---
     def _norm_snv(self):
         var_name, ref, n_bands, bands_ax = self._norm_var_and_meta()
+        stat_idx = self._norm_stat_indices(n_bands)
+        n_stat = len(stat_idx)
 
-        band0 = self._norm_read_band(ref, 0)
+        band0 = self._norm_read_band(ref, int(stat_idx[0]))
         spatial_shape = band0.shape
         sum_vals = np.zeros(spatial_shape, dtype=np.float64)
         sum_sq = np.zeros(spatial_shape, dtype=np.float64)
         count = np.zeros(spatial_shape, dtype=np.int32)
 
         lbl1 = "SNV — pass 1/2: computing stats"
-        prog = self._make_norm_progress(lbl1, n_bands)
-        for i in range(n_bands):
-            band = self._norm_read_band(ref, i) if i > 0 else band0
+        prog = self._make_norm_progress(lbl1, n_stat)
+        for step, i in enumerate(stat_idx):
+            band = self._norm_read_band(ref, int(i)) if step > 0 else band0
             valid = ~np.isnan(band)
             bv = band[valid].astype(np.float64)
             sum_vals[valid] += bv
             sum_sq[valid] += bv * bv
             count[valid] += 1
-            if self._norm_should_update(i, n_bands):
-                self._norm_progress_update(prog, lbl1, i, n_bands)
+            if self._norm_should_update(step, n_stat):
+                self._norm_progress_update(prog, lbl1, step, n_stat)
         del band0
 
         safe_count = np.maximum(count, 1).astype(np.float64)
@@ -5261,18 +5757,20 @@ class HypercubeExplorer(QMainWindow):
     # --- Max-norm: divide each pixel spectrum by its maximum value ---
     def _norm_max(self):
         var_name, ref, n_bands, bands_ax = self._norm_var_and_meta()
+        stat_idx = self._norm_stat_indices(n_bands)
+        n_stat = len(stat_idx)
 
-        band0 = self._norm_read_band(ref, 0)
+        band0 = self._norm_read_band(ref, int(stat_idx[0]))
         spatial_shape = band0.shape
         mx = np.full(spatial_shape, -np.inf, dtype=np.float64)
 
         lbl1 = "Max-norm — pass 1/2: finding max"
-        prog = self._make_norm_progress(lbl1, n_bands)
-        for i in range(n_bands):
-            band = self._norm_read_band(ref, i) if i > 0 else band0
+        prog = self._make_norm_progress(lbl1, n_stat)
+        for step, i in enumerate(stat_idx):
+            band = self._norm_read_band(ref, int(i)) if step > 0 else band0
             np.fmax(mx, np.where(np.isnan(band), -np.inf, band), out=mx)
-            if self._norm_should_update(i, n_bands):
-                self._norm_progress_update(prog, lbl1, i, n_bands)
+            if self._norm_should_update(step, n_stat):
+                self._norm_progress_update(prog, lbl1, step, n_stat)
         del band0
 
         mx[mx == -np.inf] = 1.0
@@ -6553,6 +7051,714 @@ class HypercubeExplorer(QMainWindow):
         for p in peaks:
             self.line_ax.annotate(f'({data[p]:.2f}, {wavelengths[p]:.2f} nm)', (wavelengths[p], data[p]),
                                   textcoords="offset points", xytext=(0, 10), ha='center', fontsize=6)
+
+    # ====== Chemometrics (PCA / NMF / clustering) ======
+    def _chem_icon(self, kind, color=None, size=16):
+        """Small hand-drawn icon for the Chemometrics UI (no external files)."""
+        pm = QPixmap(size, size)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        if kind == 'pca':
+            # diverging score map: red / blue halves
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor('#c0392b'))
+            p.drawRoundedRect(1, 2, 6, 12, 2, 2)
+            p.setBrush(QColor('#2980b9'))
+            p.drawRoundedRect(9, 2, 6, 12, 2, 2)
+        elif kind == 'nmf':
+            # additive non-negative components: stacked bars
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor('#1e8449')); p.drawRect(2, 8, 3, 6)
+            p.setBrush(QColor('#2ecc71')); p.drawRect(6, 3, 3, 11)
+            p.setBrush(QColor('#82e0aa')); p.drawRect(10, 10, 3, 4)
+        elif kind == 'kmeans':
+            # three cluster dots
+            p.setPen(Qt.NoPen)
+            for x, y, c in ((4.5, 4.5, '#1f77b4'), (11.5, 6.0, '#ff7f0e'), (6.5, 11.5, '#2ca02c')):
+                p.setBrush(QColor(c))
+                p.drawEllipse(QPointF(x, y), 3.0, 3.0)
+        elif kind == 'spectrum':
+            # loading spectrum with a peak
+            p.setPen(QPen(QColor('#2c3e50'), 1.6))
+            pts = [(1, 12), (4, 10), (6, 3), (8, 11), (11, 5), (13, 9), (15, 8)]
+            for a, b in zip(pts[:-1], pts[1:]):
+                p.drawLine(QPointF(*a), QPointF(*b))
+        elif kind == 'scatter':
+            # two point clouds
+            p.setPen(Qt.NoPen)
+            for x, y, c in ((3, 11, '#1f77b4'), (5, 8.5, '#1f77b4'), (7, 12, '#1f77b4'),
+                            (10, 4, '#ff7f0e'), (12, 6.5, '#ff7f0e'), (13.5, 3, '#ff7f0e')):
+                p.setBrush(QColor(c))
+                p.drawEllipse(QPointF(x, y), 1.8, 1.8)
+        elif kind == 'silhouette':
+            # silhouette blades
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor('#1f77b4')); p.drawRect(1, 2, 12, 3)
+            p.setBrush(QColor('#ff7f0e')); p.drawRect(1, 7, 9, 3)
+            p.setBrush(QColor('#2ca02c')); p.drawRect(1, 12, 6, 3)
+        elif kind == 'swatch':
+            qc = color if isinstance(color, QColor) else QColor(color)
+            p.setBrush(qc)
+            p.setPen(QPen(qc.darker(140), 1))
+            p.drawRoundedRect(2, 2, 12, 12, 3, 3)
+        p.end()
+        return QIcon(pm)
+
+    def _chem_reset(self):
+        """Clear chemometrics results (called when a new cube is loaded)."""
+        self.chem_result = None
+        if not hasattr(self, 'chem_comp_combo'):
+            return
+        for combo in (self.chem_comp_combo, self.chem_scatter_x_combo, self.chem_scatter_y_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.blockSignals(False)
+        self.chem_status_label.setText("No analysis run yet.")
+        self.chem_peaks_label.setText("Top peaks: —")
+        self.chem_colorbar = None
+        self.chem_canvas.figure.clf()
+        self.chem_ax = self.chem_canvas.figure.add_subplot(111)
+        self.chem_canvas.setMinimumHeight(0)
+        self.chem_canvas.draw_idle()
+        self.chem_plot_ax.clear(); self.chem_plot_canvas.draw_idle()
+        self.chem_scatter_colorbar = None
+        self.chem_scatter_canvas.figure.clf()
+        self.chem_scatter_ax = self.chem_scatter_canvas.figure.add_subplot(111)
+        self.chem_scatter_canvas.draw_idle()
+        self.chem_sil_canvas.figure.clf()
+        self.chem_sil_canvas.draw_idle()
+        # Default the spectral range to the cube's band range
+        bands = self._get_bands_values(warn=False)
+        if bands is not None and bands.size:
+            self.chem_wl_min_spin.setValue(float(np.min(bands)))
+            self.chem_wl_max_spin.setValue(float(np.max(bands)))
+        self._update_spectrometer_info()
+
+    def _chem_prepare_matrix(self):
+        """Flatten the current cube to (pixels x bands) restricted to the chosen
+        wavelength range, and identify valid pixels (finite, non-empty, unmasked).
+
+        Returns dict with keys: X (n_valid, n_bands float32), valid (H*W bool),
+        H, W, wl (selected wavelengths), or None on failure."""
+        if self.ds is None:
+            QMessageBox.information(self, "Chemometrics", "Load a dataset first (Tab 1).")
+            return None
+        bands = self._get_bands_values()
+        if bands is None:
+            return None
+
+        wl_min = float(self.chem_wl_min_spin.value())
+        wl_max = float(self.chem_wl_max_spin.value())
+        if wl_max <= wl_min:
+            QMessageBox.warning(self, "Chemometrics", "λ max must be greater than λ min.")
+            return None
+        band_sel = np.where((bands >= wl_min) & (bands <= wl_max))[0]
+
+        spectro_note = ""
+        try:
+            sp_idx = self._spectro_selected_band_indices(self.chem_spectro_edit.text())
+        except ValueError as e:
+            QMessageBox.warning(self, "Chemometrics", str(e))
+            return None
+        if sp_idx is not None:
+            band_sel = np.intersect1d(band_sel, sp_idx)
+            spectro_note = f"spectros {self.chem_spectro_edit.text().strip()}"
+
+        if band_sel.size < 3:
+            QMessageBox.warning(self, "Chemometrics",
+                                "Fewer than 3 bands in the selected wavelength/spectrometer range.")
+            return None
+
+        first_var = next(iter(self.ds.data_vars))
+        da = self.ds[first_var]
+        spatial_dims = [d for d in da.dims if d != 'bands']
+        if len(spatial_dims) != 2:
+            QMessageBox.warning(self, "Chemometrics", "Expected a cube with 2 spatial dimensions.")
+            return None
+        da_t = da.isel(bands=band_sel).transpose(spatial_dims[0], spatial_dims[1], 'bands')
+        cube = np.asarray(da_t.values, dtype=np.float32)
+        Hh, Ww, Bb = cube.shape
+        X_all = cube.reshape(Hh * Ww, Bb)
+
+        valid = np.isfinite(X_all).all(axis=1)
+        # all-zero spectra are masked-out or empty pixels
+        valid &= np.nanmax(np.abs(X_all), axis=1) > 0
+        if self.chem_exclude_mask_cb.isChecked() and self.active_mask is not None \
+                and self.active_mask.shape == (Hh, Ww):
+            valid &= ~self.active_mask.reshape(-1)
+
+        n_valid = int(valid.sum())
+        if n_valid < max(50, int(self.chem_ncomp_spin.value()) * 10):
+            QMessageBox.warning(self, "Chemometrics",
+                                f"Only {n_valid} valid pixels — not enough for a meaningful decomposition.")
+            return None
+
+        return {'X': X_all[valid], 'valid': valid, 'H': Hh, 'W': Ww,
+                'wl': bands[band_sel], 'spectro_note': spectro_note}
+
+    _CHEM_BTN_STYLE_IDLE = "font-weight:bold; padding:4px;"
+    _CHEM_BTN_STYLE_BUSY = ("font-weight:bold; padding:4px; "
+                            "background-color:#f39c12; color:white;")
+
+    def _chem_run(self):
+        try:
+            from sklearn.decomposition import PCA, NMF
+            from sklearn.cluster import KMeans
+        except ImportError:
+            QMessageBox.critical(self, "Chemometrics",
+                                 "scikit-learn is required for this tab.\n\nInstall it with:\n    pip install scikit-learn")
+            return
+
+        method = self.chem_method_combo.currentText()
+        k = int(self.chem_ncomp_spin.value())
+        max_fit = int(self.chem_max_fit_spin.value())
+        standardize = bool(self.chem_standardize_cb.isChecked())
+
+        # Busy indicators: colored Run button + modal progress dialog
+        self.chem_run_btn.setEnabled(False)
+        self.chem_run_btn.setText("Running…")
+        self.chem_run_btn.setStyleSheet(self._CHEM_BTN_STYLE_BUSY)
+        prog = QProgressDialog("Preparing data matrix…", "Cancel", 0, 5, self)
+        prog.setWindowTitle("Chemometrics")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        QApplication.processEvents()
+
+        def _step(value, text):
+            """Advance the progress dialog; returns False if the user cancelled."""
+            if prog.wasCanceled():
+                return False
+            prog.setValue(value)
+            prog.setLabelText(text)
+            QApplication.processEvents()
+            return not prog.wasCanceled()
+
+        try:
+            prep = self._chem_prepare_matrix()
+            if prep is None:
+                return
+
+            X = prep['X']; valid = prep['valid']
+            Hh, Ww, wl = prep['H'], prep['W'], prep['wl']
+            n_valid = X.shape[0]
+
+            if k > min(X.shape) - 1:
+                QMessageBox.warning(self, "Chemometrics",
+                                    f"Too many components ({k}) for {n_valid} pixels × {X.shape[1]} bands.")
+                return
+
+            if not _step(1, "Preprocessing spectra…"):
+                self.chem_status_label.setText("Analysis cancelled.")
+                return
+
+            notes = []
+            if prep.get('spectro_note'):
+                notes.append(prep['spectro_note'])
+            scale = None
+            Xw = X
+            if standardize and method != "NMF":
+                std = X.std(axis=0)
+                std[std <= 0] = 1.0
+                scale = std
+                Xw = X / std[None, :]
+                notes.append("bands standardized")
+
+            rng = np.random.default_rng(0)
+            if n_valid > max_fit:
+                fit_idx = rng.choice(n_valid, size=max_fit, replace=False)
+                notes.append(f"fitted on {max_fit:,} of {n_valid:,} px")
+            else:
+                fit_idx = None
+
+            X_fit = Xw if fit_idx is None else Xw[fit_idx]
+
+            fit_n = X_fit.shape[0]
+            if not _step(2, f"Fitting {method} on {fit_n:,} pixels…"):
+                self.chem_status_label.setText("Analysis cancelled.")
+                return
+
+            result = {'method': method, 'wl': wl, 'H': Hh, 'W': Ww, 'valid': valid}
+            if method == "PCA":
+                model = PCA(n_components=k, random_state=0)
+                model.fit(X_fit)
+                if not _step(3, f"Projecting all {n_valid:,} pixels…"):
+                    self.chem_status_label.setText("Analysis cancelled.")
+                    return
+                scores = model.transform(Xw)                    # (n_valid, k)
+                result['maps'] = scores
+                result['loadings'] = np.asarray(model.components_, dtype=float)  # (k, B)
+                result['evr'] = np.asarray(model.explained_variance_ratio_, dtype=float)
+            elif method == "NMF":
+                Xn = np.clip(Xw, 0.0, None)
+                if np.any(Xw < 0):
+                    notes.append("negative values clipped to 0")
+                model = NMF(n_components=k, init='nndsvda', max_iter=400, random_state=0)
+                X_fit_n = Xn if fit_idx is None else Xn[fit_idx]
+                model.fit(X_fit_n)
+                if not _step(3, f"Projecting all {n_valid:,} pixels…"):
+                    self.chem_status_label.setText("Analysis cancelled.")
+                    return
+                scores = model.transform(Xn)
+                result['maps'] = scores
+                result['loadings'] = np.asarray(model.components_, dtype=float)
+                result['evr'] = None
+            else:  # K-Means
+                model = KMeans(n_clusters=k, n_init=10, random_state=0)
+                model.fit(X_fit)
+                if not _step(3, f"Assigning all {n_valid:,} pixels to clusters…"):
+                    self.chem_status_label.setText("Analysis cancelled.")
+                    return
+                labels = model.predict(Xw)
+                result['labels'] = labels
+                if scale is not None:
+                    # centroids back in original intensity units for readability
+                    result['loadings'] = np.asarray(model.cluster_centers_, dtype=float) * scale[None, :]
+                else:
+                    result['loadings'] = np.asarray(model.cluster_centers_, dtype=float)
+                counts = np.bincount(labels, minlength=k)
+                result['cluster_frac'] = counts / max(1, labels.size)
+
+            if not _step(4, "Rendering maps and spectra…"):
+                self.chem_status_label.setText("Analysis cancelled.")
+                return
+
+            self.chem_result = result
+
+            # populate component selector
+            if method == "K-Means clustering":
+                # swatches matching the cluster colors on the map
+                comp_icons = [self._chem_icon('swatch', QColor.fromRgbF(*c[:3]))
+                              for c in self._chem_cluster_colors(k)]
+            else:
+                comp_icons = [self._chem_icon('pca' if method == "PCA" else 'nmf')] * k
+
+            self.chem_comp_combo.blockSignals(True)
+            self.chem_comp_combo.clear()
+            if method == "PCA":
+                for i in range(k):
+                    self.chem_comp_combo.addItem(comp_icons[i], f"PC{i+1}  ({100*result['evr'][i]:.1f}% var)")
+            elif method == "NMF":
+                for i in range(k):
+                    self.chem_comp_combo.addItem(comp_icons[i], f"Component {i+1}")
+            else:
+                for i in range(k):
+                    self.chem_comp_combo.addItem(comp_icons[i],
+                                                 f"Cluster {i+1}  ({100*result['cluster_frac'][i]:.1f}% of px)")
+            self.chem_comp_combo.setCurrentIndex(0)
+            self.chem_comp_combo.blockSignals(False)
+
+            # scatter axis selectors mirror the component list (PCA/NMF only)
+            items = [self.chem_comp_combo.itemText(i) for i in range(k)]
+            for combo in (self.chem_scatter_x_combo, self.chem_scatter_y_combo):
+                combo.blockSignals(True)
+                combo.clear()
+                if method != "K-Means clustering":
+                    for i in range(k):
+                        combo.addItem(comp_icons[i], items[i])
+                combo.blockSignals(False)
+            if method != "K-Means clustering":
+                self.chem_scatter_x_combo.setCurrentIndex(0)
+                self.chem_scatter_y_combo.setCurrentIndex(min(1, k - 1))
+
+            txt = f"{method}: {n_valid:,} px × {wl.size} bands ({wl.min():.1f}–{wl.max():.1f} nm)"
+            if method == "PCA":
+                txt += f"  |  {100*result['evr'].sum():.1f}% variance in {k} PCs"
+            if notes:
+                txt += "  |  " + "; ".join(notes)
+            self.chem_status_label.setText(txt)
+
+            self._chem_update_map()
+            self._chem_update_loading_plot()
+            self._chem_update_scatter()
+            prog.setValue(5)
+        except Exception as e:
+            QMessageBox.critical(self, "Chemometrics", f"Analysis failed:\n{e}")
+            self.chem_status_label.setText("Analysis failed.")
+        finally:
+            prog.close()
+            self.chem_run_btn.setEnabled(True)
+            self.chem_run_btn.setText("Run analysis")
+            self.chem_run_btn.setStyleSheet(self._CHEM_BTN_STYLE_IDLE)
+
+    def _chem_on_component_changed(self, *_):
+        if self.chem_result is None:
+            return
+        self._chem_update_map()
+        self._chem_update_loading_plot()
+
+    def _chem_cluster_colors(self, k):
+        import matplotlib as mpl
+        cmap = mpl.colormaps['tab10'] if k <= 10 else mpl.colormaps['tab20']
+        return [cmap(i % cmap.N) for i in range(k)]
+
+    def _chem_score_image(self, res, i):
+        """Full-size (H, W) score/abundance map of component i (NaN outside valid px)."""
+        full = np.full(res['H'] * res['W'], np.nan)
+        full[res['valid']] = res['maps'][:, i]
+        return full.reshape(res['H'], res['W'])
+
+    def _chem_draw_score_map(self, ax, fig, res, i, title_fs=8):
+        """Draw one component map on the given axes; returns the colorbar."""
+        img = self._chem_score_image(res, i)
+        vals = img[np.isfinite(img)]
+        if vals.size:
+            vmin, vmax = np.percentile(vals, [2, 98])
+            if vmin == vmax:
+                vmax = vmin + 1e-6
+        else:
+            vmin, vmax = 0, 1
+        if res['method'] == "PCA":
+            # symmetric diverging scale so sign is meaningful
+            lim = max(abs(vmin), abs(vmax))
+            im = ax.imshow(img, cmap='RdBu_r', vmin=-lim, vmax=lim, interpolation='nearest')
+        else:
+            im = ax.imshow(img, cmap='viridis', vmin=vmin, vmax=vmax, interpolation='nearest')
+        cbar = fig.colorbar(im, ax=ax, shrink=0.85)
+        cbar.ax.tick_params(labelsize=5)
+        ax.set_title(self.chem_comp_combo.itemText(i), fontsize=title_fs)
+        ax.tick_params(axis='both', which='major', labelsize=6)
+        return cbar
+
+    def _chem_update_map(self, *_):
+        res = self.chem_result
+        if res is None:
+            return
+        fig = self.chem_canvas.figure
+        fig.clf()
+        self.chem_colorbar = None
+        self.chem_ax = None
+
+        idx = max(0, self.chem_comp_combo.currentIndex())
+        Hh, Ww, valid = res['H'], res['W'], res['valid']
+        grid_mode = (self.chem_grid_cb.isChecked()
+                     and res['method'] != "K-Means clustering")
+
+        if res['method'] == "K-Means clustering":
+            self.chem_ax = fig.add_subplot(111)
+            k = res['loadings'].shape[0]
+            full = np.full(Hh * Ww, np.nan)
+            full[valid] = res['labels']
+            img = full.reshape(Hh, Ww)
+            from matplotlib.colors import ListedColormap
+            cmap = ListedColormap(self._chem_cluster_colors(k))
+            cmap.set_bad(color='black')
+            im = self.chem_ax.imshow(np.ma.masked_invalid(img), cmap=cmap,
+                                     vmin=-0.5, vmax=k - 0.5, interpolation='nearest')
+            self.chem_colorbar = fig.colorbar(im, ax=self.chem_ax,
+                                              ticks=range(k), shrink=0.85)
+            self.chem_colorbar.ax.set_yticklabels([f"C{i+1}" for i in range(k)], fontsize=6)
+            self.chem_ax.set_title(f"Chemical domains (K-Means, k={k})", fontsize=8)
+            self.chem_ax.tick_params(axis='both', which='major', labelsize=6)
+            self.chem_canvas.setMinimumHeight(0)
+        elif grid_mode:
+            k = res['maps'].shape[1]
+            ncols = 2 if k > 1 else 1
+            nrows = int(np.ceil(k / ncols))
+            for i in range(k):
+                ax = fig.add_subplot(nrows, ncols, i + 1)
+                ax._chem_comp_idx = i  # for click-to-select
+                self._chem_draw_score_map(ax, fig, res, i, title_fs=7)
+                if i == idx:
+                    ax.set_title(self.chem_comp_combo.itemText(i),
+                                 fontsize=7, fontweight='bold', color='#c0392b')
+                    for spine in ax.spines.values():
+                        spine.set_edgecolor('#c0392b'); spine.set_linewidth(1.5)
+            try:
+                fig.tight_layout(pad=0.8)
+            except Exception:
+                pass
+            # Give each row a fixed pixel height; the scroll area shows a
+            # scrollbar when the grid grows taller than the visible panel.
+            row_px = 260
+            self.chem_canvas.setMinimumHeight(nrows * row_px)
+        else:
+            self.chem_ax = fig.add_subplot(111)
+            title = self.chem_comp_combo.currentText() + (
+                " score map" if res['method'] == "PCA" else " abundance map")
+            self._chem_draw_score_map(self.chem_ax, fig, res, idx)
+            self.chem_ax.set_title(title, fontsize=8)
+            self.chem_canvas.setMinimumHeight(0)
+
+        self.chem_canvas.draw_idle()
+
+    def _chem_on_map_click(self, event):
+        """In grid mode, clicking a component map selects that component."""
+        if self.chem_result is None or event.inaxes is None:
+            return
+        if getattr(self.chem_toolbar, 'mode', ''):  # zoom/pan active
+            return
+        i = getattr(event.inaxes, '_chem_comp_idx', None)
+        if i is not None and i != self.chem_comp_combo.currentIndex():
+            self.chem_comp_combo.setCurrentIndex(int(i))
+
+    def _chem_update_scatter(self, *_):
+        res = self.chem_result
+        ax = self.chem_scatter_ax
+        ax.clear()
+        if getattr(self, 'chem_scatter_colorbar', None) is not None:
+            try: self.chem_scatter_colorbar.remove()
+            except Exception: pass
+            self.chem_scatter_colorbar = None
+        if res is None:
+            self.chem_scatter_canvas.draw_idle()
+            return
+        if res['method'] == "K-Means clustering":
+            ax.text(0.5, 0.5, "Score scatter is available for PCA / NMF results.\n"
+                              "(K-Means produces discrete labels, not scores.)",
+                    ha='center', va='center', fontsize=8, transform=ax.transAxes)
+            self.chem_scatter_canvas.draw_idle()
+            return
+
+        ix = self.chem_scatter_x_combo.currentIndex()
+        iy = self.chem_scatter_y_combo.currentIndex()
+        k = res['maps'].shape[1]
+        if ix < 0 or iy < 0 or ix >= k or iy >= k:
+            self.chem_scatter_canvas.draw_idle()
+            return
+
+        xs = res['maps'][:, ix]
+        ys = res['maps'][:, iy]
+        hb = ax.hexbin(xs, ys, gridsize=70, bins='log', mincnt=1, cmap='inferno')
+        self.chem_scatter_colorbar = self.chem_scatter_canvas.figure.colorbar(
+            hb, ax=ax, shrink=0.85, label='px count (log)')
+        self.chem_scatter_colorbar.ax.tick_params(labelsize=5)
+        if res['method'] == "PCA":
+            ax.axhline(0.0, color='gray', lw=0.6, ls='--')
+            ax.axvline(0.0, color='gray', lw=0.6, ls='--')
+        ax.set_xlabel(self.chem_scatter_x_combo.currentText(), fontsize=8)
+        ax.set_ylabel(self.chem_scatter_y_combo.currentText(), fontsize=8)
+        ax.set_title("Pixel scores — separate branches/blobs suggest distinct chemical domains",
+                     fontsize=7)
+        ax.tick_params(axis='both', which='major', labelsize=6)
+        self.chem_scatter_canvas.draw_idle()
+
+    def _chem_label_peaks(self, ax, wl, y, n_top, two_sided):
+        """Mark the strongest spectral peaks of a loading/centroid and return their wavelengths."""
+        if n_top <= 0:
+            return []
+        cands = []
+        rng_y = float(np.nanmax(np.abs(y))) if y.size else 0.0
+        if rng_y <= 0:
+            return []
+        prom = 0.02 * rng_y
+        pk, _ = find_peaks(y, prominence=prom)
+        cands.extend((int(p), float(y[p])) for p in pk)
+        if two_sided:
+            pk_neg, _ = find_peaks(-y, prominence=prom)
+            cands.extend((int(p), float(y[p])) for p in pk_neg)
+        if not cands:
+            return []
+        cands.sort(key=lambda t: abs(t[1]), reverse=True)
+        picked = cands[:n_top]
+        for p, v in picked:
+            ax.plot(wl[p], v, 'rx', ms=4)
+            ax.annotate(f"{wl[p]:.2f}", (wl[p], v), textcoords="offset points",
+                        xytext=(0, 8 if v >= 0 else -12), ha='center', fontsize=6, color='red')
+        return [float(wl[p]) for p, _ in sorted(picked, key=lambda t: abs(t[1]), reverse=True)]
+
+    def _chem_update_loading_plot(self):
+        res = self.chem_result
+        if res is None:
+            return
+        idx = max(0, self.chem_comp_combo.currentIndex())
+        wl = res['wl']
+        n_top = int(self.chem_npeaks_spin.value())
+        ax = self.chem_plot_ax
+        ax.clear()
+
+        if res['method'] == "K-Means clustering":
+            k = res['loadings'].shape[0]
+            colors = self._chem_cluster_colors(k)
+            for i in range(k):
+                if i == idx:
+                    continue
+                ax.plot(wl, res['loadings'][i], color=colors[i], lw=0.7, alpha=0.35)
+            ax.plot(wl, res['loadings'][idx], color=colors[idx], lw=1.4,
+                    label=f"Cluster {idx+1} centroid")
+            peaks = self._chem_label_peaks(ax, wl, res['loadings'][idx], n_top, two_sided=False)
+            ax.set_title(f"Cluster centroid spectra (Cluster {idx+1} highlighted)", fontsize=8)
+            ax.set_ylabel("Intensity (a.u.)", fontsize=8)
+            ax.legend(fontsize=6, loc='best')
+        else:
+            loading = res['loadings'][idx]
+            two_sided = res['method'] == "PCA"
+            ax.plot(wl, loading, lw=0.9)
+            if two_sided:
+                ax.axhline(0.0, color='gray', lw=0.6, ls='--')
+            peaks = self._chem_label_peaks(ax, wl, loading, n_top, two_sided=two_sided)
+            name = self.chem_comp_combo.currentText().split("  ")[0]
+            if res['method'] == "PCA":
+                ax.set_title(f"{name} loadings — peaks pointing up co-vary with red map areas,\n"
+                             f"peaks pointing down with blue areas", fontsize=7)
+                ax.set_ylabel("Loading", fontsize=8)
+            else:
+                ax.set_title(f"{name} spectral signature", fontsize=8)
+                ax.set_ylabel("Weight", fontsize=8)
+
+        ax.set_xlabel("Wavelength (nm)", fontsize=8)
+        ax.tick_params(axis='both', which='major', labelsize=6)
+        if peaks:
+            self.chem_peaks_label.setText("Top peaks (nm): " + ", ".join(f"{p:.2f}" for p in peaks))
+        else:
+            self.chem_peaks_label.setText("Top peaks: —")
+        self.chem_plot_canvas.draw_idle()
+
+    def _chem_silhouette_scan(self):
+        """Run K-Means for k = 2 … k_max and plot silhouette scores to suggest
+        the number of chemical domains (plus the silhouette diagram of the best k)."""
+        try:
+            from sklearn.cluster import KMeans
+            from sklearn.metrics import silhouette_score, silhouette_samples
+        except ImportError:
+            QMessageBox.critical(self, "Chemometrics",
+                                 "scikit-learn is required for this tab.\n\nInstall it with:\n    pip install scikit-learn")
+            return
+
+        kmax = int(self.chem_kmax_spin.value())
+        ks = list(range(2, kmax + 1))
+        max_fit = int(self.chem_max_fit_spin.value())
+        standardize = bool(self.chem_standardize_cb.isChecked())
+
+        self.chem_sil_btn.setEnabled(False)
+        self.chem_sil_btn.setText("Scanning…")
+        self.chem_sil_btn.setStyleSheet(self._CHEM_BTN_STYLE_BUSY)
+        prog = QProgressDialog("Preparing data matrix…", "Cancel", 0, len(ks) + 1, self)
+        prog.setWindowTitle("Silhouette scan")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+        QApplication.processEvents()
+
+        try:
+            prep = self._chem_prepare_matrix()
+            if prep is None:
+                return
+            X = prep['X']
+            n_valid = X.shape[0]
+            if standardize:
+                std = X.std(axis=0)
+                std[std <= 0] = 1.0
+                X = X / std[None, :]
+
+            rng = np.random.default_rng(0)
+            if n_valid > max_fit:
+                X_fit = X[rng.choice(n_valid, size=max_fit, replace=False)]
+            else:
+                X_fit = X
+            n_fit = X_fit.shape[0]
+            # silhouette is O(n²): score a fixed-size subsample of the fitted pixels
+            n_sil = min(4000, n_fit)
+            sil_idx = (rng.choice(n_fit, size=n_sil, replace=False)
+                       if n_fit > n_sil else np.arange(n_fit))
+            X_sil = X_fit[sil_idx]
+
+            scores = []
+            labels_per_k = []
+            for j, k in enumerate(ks):
+                if prog.wasCanceled():
+                    self.chem_status_label.setText("Silhouette scan cancelled.")
+                    return
+                prog.setValue(j + 1)
+                prog.setLabelText(f"K-Means with k = {k}  ({j+1}/{len(ks)})…")
+                QApplication.processEvents()
+
+                km = KMeans(n_clusters=k, n_init=5, random_state=0).fit(X_fit)
+                lab = km.labels_[sil_idx]
+                if np.unique(lab).size < 2:
+                    scores.append(np.nan)
+                    labels_per_k.append(None)
+                else:
+                    scores.append(float(silhouette_score(X_sil, lab)))
+                    labels_per_k.append(lab)
+
+            scores = np.asarray(scores, dtype=float)
+            if not np.any(np.isfinite(scores)):
+                QMessageBox.warning(self, "Silhouette scan",
+                                    "No valid silhouette scores could be computed.")
+                return
+            best_j = int(np.nanargmax(scores))
+            best_k = ks[best_j]
+            best_labels = labels_per_k[best_j]
+            sil_vals = silhouette_samples(X_sil, best_labels)
+
+            # ---- plot: score-vs-k curve (top) + silhouette diagram of best k (bottom) ----
+            fig = self.chem_sil_canvas.figure
+            fig.clf()
+            ax1 = fig.add_subplot(211)
+            ax2 = fig.add_subplot(212)
+
+            ax1.plot(ks, scores, 'o-', lw=1.0, ms=4)
+            ax1.plot(best_k, scores[best_j], 'o', ms=9, mfc='none', mec='#c0392b', mew=1.6)
+            ax1.annotate(f"suggested k = {best_k}", (best_k, scores[best_j]),
+                         textcoords="offset points", xytext=(8, 8), fontsize=7, color='#c0392b')
+            ax1.set_xlabel("Number of clusters k", fontsize=8)
+            ax1.set_ylabel("Mean silhouette", fontsize=8)
+            ax1.set_xticks(ks)
+            ax1.set_title(f"Silhouette scan ({n_sil:,} sampled px) — higher = better-separated domains",
+                          fontsize=7)
+            ax1.tick_params(axis='both', which='major', labelsize=6)
+
+            colors = self._chem_cluster_colors(best_k)
+            y0 = 0
+            for ci in range(best_k):
+                vals = np.sort(sil_vals[best_labels == ci])
+                if vals.size == 0:
+                    continue
+                ax2.fill_betweenx(np.arange(y0, y0 + vals.size), 0, vals,
+                                  facecolor=colors[ci], edgecolor=colors[ci], alpha=0.8)
+                ax2.text(-0.02, y0 + vals.size / 2, f"C{ci+1}", fontsize=6,
+                         ha='right', va='center', color=colors[ci])
+                y0 += vals.size + max(10, n_sil // 100)
+            ax2.axvline(float(np.mean(sil_vals)), color='#c0392b', ls='--', lw=0.8)
+            ax2.set_xlabel("Silhouette coefficient", fontsize=8)
+            ax2.set_yticks([])
+            ax2.set_title(f"Per-pixel silhouettes at k = {best_k} "
+                          f"(dashed line = mean; clusters cut by the line are weak)", fontsize=7)
+            ax2.tick_params(axis='x', which='major', labelsize=6)
+
+            try:
+                fig.tight_layout(pad=0.8)
+            except Exception:
+                pass
+            self.chem_sil_canvas.draw_idle()
+            self.chem_plot_tabs.setCurrentIndex(2)
+
+            self.chem_status_label.setText(
+                f"Silhouette scan k=2–{kmax}: suggested k = {best_k} "
+                f"(score {scores[best_j]:.3f}). Set 'Components / clusters' and run K-Means.")
+        except Exception as e:
+            QMessageBox.critical(self, "Silhouette scan", f"Scan failed:\n{e}")
+            self.chem_status_label.setText("Silhouette scan failed.")
+        finally:
+            prog.close()
+            self.chem_sil_btn.setEnabled(True)
+            self.chem_sil_btn.setText("Silhouette scan (suggest k)")
+            self.chem_sil_btn.setStyleSheet(self._CHEM_BTN_STYLE_IDLE)
+
+    def _chem_export_spectra(self):
+        res = self.chem_result
+        if res is None:
+            QMessageBox.information(self, "Chemometrics", "Run an analysis first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save component spectra", "",
+                                              "CSV Files (*.csv);;All Files (*)")
+        if not path:
+            return
+        data = {'Wavelength (nm)': res['wl']}
+        if res['method'] == "K-Means clustering":
+            for i in range(res['loadings'].shape[0]):
+                data[f"Cluster {i+1} centroid"] = res['loadings'][i]
+        else:
+            for i in range(res['loadings'].shape[0]):
+                data[f"Component {i+1}"] = res['loadings'][i]
+        try:
+            pd.DataFrame(data).to_csv(path, index=False)
+            self._refresh_status_bar(f"Component spectra saved: {os.path.basename(path)}")
+        except Exception as e:
+            QMessageBox.critical(self, "Chemometrics", f"Could not save CSV:\n{e}")
+
     
     def _build_experiment_from_ui(self, name: str) -> ExperimentState:
         # figure out element label vs slider
@@ -6722,6 +7928,7 @@ class HypercubeExplorer(QMainWindow):
                 if bands is None:
                     return
                 self.slider.setMaximum(len(bands) - 1)
+                self._chem_reset()
             except Exception as e:
                 QMessageBox.critical(self, "Project", f"Could not open cube:\n{e}")
                 return

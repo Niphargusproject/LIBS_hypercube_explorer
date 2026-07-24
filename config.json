@@ -2,15 +2,15 @@
   "window_width": 1920,
   "window_height": 1121,
   "imaging_splitter": [
-    678,
-    1206
+    569,
+    1315
   ],
   "science_splitter": [
     1062,
     822
   ],
   "science_left_splitter": [
-    589,
-    420
+    462,
+    547
   ]
 }
