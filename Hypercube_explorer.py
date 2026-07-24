@@ -6529,6 +6529,11 @@ class HypercubeExplorer(QMainWindow):
             QMessageBox.warning(self, "Selection error", "No spectrum data found at the selected pixel.")
             return
         self.current_pixel = (y, x); self.current_spectrum = spectrum[0]
+        # Preserve zoom/pan across pixel clicks: toolbar zoom/pan turns autoscale
+        # off, so a disabled autoscale means the user set a custom view.
+        keep_view = not (self.line_ax.get_autoscalex_on() and self.line_ax.get_autoscaley_on())
+        if keep_view:
+            prev_xlim = self.line_ax.get_xlim(); prev_ylim = self.line_ax.get_ylim()
         self.line_ax.clear(); self.line_ax.plot(wavelengths, self.current_spectrum)
         self.line_ax.set_title(f"Spectrum at pixel ({x}, {y})", fontsize=8)
         self.line_ax.set_xlabel("Wavelength (nm)", fontsize=8)
@@ -6537,6 +6542,8 @@ class HypercubeExplorer(QMainWindow):
         self.spectrum_plot_data = pd.DataFrame({'Wavelength (nm)': wavelengths, 'Intensity': self.current_spectrum})
         if self.peak_detection_checkbox.isChecked():
             self.detect_peaks(self.current_spectrum, wavelengths)
+        if keep_view:
+            self.line_ax.set_xlim(prev_xlim); self.line_ax.set_ylim(prev_ylim)
         self.line_plot_canvas.draw_idle()
 
     def detect_peaks(self, data, wavelengths):
