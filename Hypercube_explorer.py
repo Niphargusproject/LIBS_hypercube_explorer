@@ -1006,6 +1006,9 @@ class HypercubeExplorer(QMainWindow):
         # Chemometrics (PCA/NMF/clustering) state
         self.chem_result = None
         self.chem_colorbar = None
+        # SAM reference spectra: list of {'name', 'wl', 'sp'} dicts.
+        # Kept across cube loads on purpose (cross-sample comparison).
+        self.chem_sam_refs = []
 
         # ----- build UI -----
         self._build_menubar()
@@ -2191,14 +2194,23 @@ class HypercubeExplorer(QMainWindow):
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(4)
 
-        ctrl_scroll = QScrollArea()
-        ctrl_scroll.setWidgetResizable(True)
-        ctrl_scroll.setFrameShape(QScrollArea.NoFrame)
-        ctrl_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        ctrl_inner = QWidget()
-        ctrl_lay = QVBoxLayout(ctrl_inner)
-        ctrl_lay.setContentsMargins(2, 2, 2, 2)
-        ctrl_lay.setSpacing(4)
+        # -- Mini tab widget: Analysis | SAM refs | Results (declutters the sidebar) --
+        self.chem_settings_tabs = QTabWidget()
+        self.chem_settings_tabs.setMinimumWidth(200)
+
+        def _make_settings_tab(group):
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            inner = QWidget()
+            lay = QVBoxLayout(inner)
+            lay.setContentsMargins(2, 2, 2, 2)
+            lay.setSpacing(4)
+            lay.addWidget(group)
+            lay.addStretch()
+            scroll.setWidget(inner)
+            return scroll
 
         # --- Group: Analysis setup ---
         grpA = QGroupBox("Analysis")
@@ -2207,11 +2219,17 @@ class HypercubeExplorer(QMainWindow):
         fa.setSpacing(4)
 
         self.chem_method_combo = QComboBox()
-        self.chem_method_combo.addItems(["PCA", "NMF", "K-Means clustering"])
+        self.chem_method_combo.addItems(["PCA", "NMF", "K-Means clustering",
+                                         "SAM (Spectral Angle Mapper)",
+                                         "Unmixing (NNLS)"])
         self.chem_method_combo.setToolTip(
             "PCA: orthogonal components, loadings show which peaks vary together (can be negative).\n"
             "NMF: additive non-negative 'endmember-like' spectra, often easier to read chemically.\n"
-            "K-Means: hard segmentation into chemical domains; centroid spectra show what defines each domain."
+            "K-Means: hard segmentation into chemical domains; centroid spectra show what defines each domain.\n"
+            "SAM: supervised — matches each pixel to user-provided reference spectra by spectral\n"
+            "angle (intensity-invariant). Add references in the 'References' tab.\n"
+            "Unmixing: supervised — models each pixel as a non-negative mixture of the reference\n"
+            "spectra (NNLS) and maps the abundance fraction of each, plus a residual map."
         )
         fa.addRow("Method:", self.chem_method_combo)
 
@@ -2291,7 +2309,71 @@ class HypercubeExplorer(QMainWindow):
         self.chem_status_label.setWordWrap(True)
         fa.addRow(self.chem_status_label)
 
-        ctrl_lay.addWidget(grpA)
+        self.chem_settings_tabs.addTab(_make_settings_tab(grpA), "Analysis")
+
+        # --- Group: reference spectra (shared by SAM and NNLS unmixing) ---
+        self.grpSAM = QGroupBox("Reference spectra (SAM / Unmixing)")
+        fsam = QFormLayout(self.grpSAM)
+        fsam.setContentsMargins(6, 14, 6, 6)
+        fsam.setSpacing(4)
+
+        self.chem_sam_list = QListWidget()
+        self.chem_sam_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.chem_sam_list.setMaximumHeight(90)
+        self.chem_sam_list.setToolTip(
+            "Reference (endmember) spectra used by SAM and NNLS unmixing")
+        fsam.addRow(self.chem_sam_list)
+
+        sam_btns1 = QHBoxLayout()
+        self.chem_sam_add_pixel_btn = QPushButton("Add pixel")
+        self.chem_sam_add_pixel_btn.setToolTip(
+            "Add the pixel spectrum currently selected in the Data Extraction tab")
+        self.chem_sam_add_result_btn = QPushButton("Add last run")
+        self.chem_sam_add_result_btn.setToolTip(
+            "Add the centroids / components of the last K-Means or NMF run as references")
+        sam_btns1.addWidget(self.chem_sam_add_pixel_btn)
+        sam_btns1.addWidget(self.chem_sam_add_result_btn)
+        fsam.addRow(sam_btns1)
+
+        sam_btns2 = QHBoxLayout()
+        self.chem_sam_load_btn = QPushButton("Load CSV…")
+        self.chem_sam_load_btn.setToolTip(
+            "Load references from CSV: first column wavelength (nm),\n"
+            "one column per reference spectrum (same format as\n"
+            "'Save component spectra (CSV)')")
+        self.chem_sam_rename_btn = QPushButton("Rename")
+        self.chem_sam_rename_btn.setToolTip("Rename the selected reference (or double-click it)")
+        sam_btns2.addWidget(self.chem_sam_load_btn)
+        sam_btns2.addWidget(self.chem_sam_rename_btn)
+        fsam.addRow(sam_btns2)
+
+        sam_btns3 = QHBoxLayout()
+        self.chem_sam_remove_btn = QPushButton("Remove")
+        self.chem_sam_clear_btn = QPushButton("Clear")
+        sam_btns3.addWidget(self.chem_sam_remove_btn)
+        sam_btns3.addWidget(self.chem_sam_clear_btn)
+        fsam.addRow(sam_btns3)
+
+        thresh_row = QHBoxLayout()
+        self.chem_sam_thresh_spin = QDoubleSpinBox()
+        self.chem_sam_thresh_spin.setDecimals(1)
+        self.chem_sam_thresh_spin.setRange(0.1, 90.0)
+        self.chem_sam_thresh_spin.setSingleStep(0.5)
+        self.chem_sam_thresh_spin.setValue(10.0)
+        self.chem_sam_thresh_spin.setToolTip(
+            "Classification cutoff: pixels whose best spectral angle exceeds this\n"
+            "value stay unclassified. 90° effectively disables the cutoff.\n"
+            "After a SAM run, changing this re-applies instantly (no re-run needed).")
+        thresh_row.addWidget(self.chem_sam_thresh_spin)
+        self.chem_sam_auto_btn = QPushButton("Suggest (Otsu)")
+        self.chem_sam_auto_btn.setToolTip(
+            "Automatically suggest the cutoff from the best-angle histogram of the\n"
+            "last SAM run (Otsu's method separates the 'matched' and 'unmatched'\n"
+            "populations). Also plots the diagnostics in the 'Silhouette' tab.")
+        thresh_row.addWidget(self.chem_sam_auto_btn)
+        fsam.addRow("Max angle (°):", thresh_row)
+
+        self.chem_settings_tabs.addTab(_make_settings_tab(self.grpSAM), "References")
 
         # --- Group: Results ---
         grpR = QGroupBox("Results")
@@ -2304,8 +2386,8 @@ class HypercubeExplorer(QMainWindow):
 
         self.chem_grid_cb = QCheckBox("Show all component maps (grid)")
         self.chem_grid_cb.setToolTip(
-            "Display every component map at once in a 2-column grid\n"
-            "(PCA/NMF only). Click a map to select that component.\n"
+            "Display every component/abundance map at once in a 2-column grid\n"
+            "(PCA, NMF, SAM angles, unmixing). Click a map to select it.\n"
             "Scroll the map panel if the grid is taller than the window."
         )
         fr.addRow(self.chem_grid_cb)
@@ -2325,9 +2407,7 @@ class HypercubeExplorer(QMainWindow):
         self.chem_export_btn = QPushButton("Save component spectra (CSV)")
         fr.addRow(self.chem_export_btn)
 
-        ctrl_lay.addWidget(grpR)
-        ctrl_lay.addStretch()
-        ctrl_scroll.setWidget(ctrl_inner)
+        self.chem_settings_tabs.addTab(_make_settings_tab(grpR), "Results")
 
         # -- Plot area: tabbed (Loadings | Score scatter) --
         self.chem_plot_tabs = QTabWidget()
@@ -2380,7 +2460,7 @@ class HypercubeExplorer(QMainWindow):
 
         right_vsplit = QSplitter(Qt.Vertical)
         right_vsplit.setChildrenCollapsible(False)
-        right_vsplit.addWidget(ctrl_scroll)
+        right_vsplit.addWidget(self.chem_settings_tabs)
         right_vsplit.addWidget(self.chem_plot_tabs)
         right_vsplit.setSizes([320, 430])
         right.addWidget(right_vsplit)
@@ -2402,18 +2482,33 @@ class HypercubeExplorer(QMainWindow):
         self.chem_scatter_y_combo.currentIndexChanged.connect(self._chem_update_scatter)
         self.chem_canvas.mpl_connect('button_press_event', self._chem_on_map_click)
         self.chem_sil_btn.clicked.connect(self._chem_silhouette_scan)
+        self.chem_method_combo.currentTextChanged.connect(self._chem_on_method_changed)
+        self.chem_sam_add_pixel_btn.clicked.connect(self._sam_add_pixel)
+        self.chem_sam_add_result_btn.clicked.connect(self._sam_add_from_result)
+        self.chem_sam_load_btn.clicked.connect(self._sam_load_csv)
+        self.chem_sam_rename_btn.clicked.connect(self._sam_rename_selected)
+        self.chem_sam_list.itemDoubleClicked.connect(lambda _item: self._sam_rename_selected())
+        self.chem_sam_remove_btn.clicked.connect(self._sam_remove_selected)
+        self.chem_sam_clear_btn.clicked.connect(self._sam_clear)
+        self.chem_sam_thresh_spin.valueChanged.connect(self._sam_apply_threshold)
+        self.chem_sam_auto_btn.clicked.connect(self._sam_auto_threshold)
 
         # Icons (drawn in code; standard style icons for the action buttons)
         style = self.style()
         self.chem_method_combo.setItemIcon(0, self._chem_icon('pca'))
         self.chem_method_combo.setItemIcon(1, self._chem_icon('nmf'))
         self.chem_method_combo.setItemIcon(2, self._chem_icon('kmeans'))
+        self.chem_method_combo.setItemIcon(3, self._chem_icon('sam'))
+        self.chem_method_combo.setItemIcon(4, self._chem_icon('unmix'))
         self.chem_run_btn.setIcon(style.standardIcon(QStyle.SP_MediaPlay))
         self.chem_sil_btn.setIcon(style.standardIcon(QStyle.SP_MessageBoxQuestion))
         self.chem_export_btn.setIcon(style.standardIcon(QStyle.SP_DialogSaveButton))
         self.chem_plot_tabs.setTabIcon(0, self._chem_icon('spectrum'))
         self.chem_plot_tabs.setTabIcon(1, self._chem_icon('scatter'))
         self.chem_plot_tabs.setTabIcon(2, self._chem_icon('silhouette'))
+        self.chem_settings_tabs.setTabIcon(0, style.standardIcon(QStyle.SP_FileDialogDetailedView))
+        self.chem_settings_tabs.setTabIcon(1, self._chem_icon('sam'))
+        self.chem_settings_tabs.setTabIcon(2, self._chem_icon('kmeans'))
 
         self.tabs.addTab(self.tabChem, "7. Chemometrics")
 
@@ -7102,6 +7197,19 @@ class HypercubeExplorer(QMainWindow):
             p.setBrush(qc)
             p.setPen(QPen(qc.darker(140), 1))
             p.drawRoundedRect(2, 2, 12, 12, 3, 3)
+        elif kind == 'sam':
+            # two spectral vectors with the angle between them
+            p.setPen(QPen(QColor('#8e44ad'), 1.6))
+            p.drawLine(QPointF(2, 14), QPointF(14, 2))
+            p.drawLine(QPointF(2, 14), QPointF(15, 11))
+            p.setPen(QPen(QColor('#8e44ad'), 1.0))
+            p.drawArc(-2, 10, 8, 8, 13 * 16, 32 * 16)
+        elif kind == 'unmix':
+            # one bar split into mixing fractions
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor('#1f77b4')); p.drawRect(1, 4, 7, 8)
+            p.setBrush(QColor('#ff7f0e')); p.drawRect(8, 4, 4, 8)
+            p.setBrush(QColor('#2ca02c')); p.drawRect(12, 4, 3, 8)
         p.end()
         return QIcon(pm)
 
@@ -7197,6 +7305,460 @@ class HypercubeExplorer(QMainWindow):
         return {'X': X_all[valid], 'valid': valid, 'H': Hh, 'W': Ww,
                 'wl': bands[band_sel], 'spectro_note': spectro_note}
 
+    # ------ SAM (Spectral Angle Mapper) ------
+    def _chem_on_method_changed(self, text):
+        """Grey out settings the reference-based methods (SAM, NNLS unmixing)
+        do not use; jump to the references tab for them."""
+        is_ref_based = text.startswith("SAM") or text.startswith("Unmixing")
+        for w in (self.chem_ncomp_spin, self.chem_max_fit_spin, self.chem_standardize_cb):
+            w.setEnabled(not is_ref_based)
+        # the max-angle cutoff is SAM-only
+        self.chem_sam_thresh_spin.setEnabled(not text.startswith("Unmixing"))
+        self.chem_sam_auto_btn.setEnabled(not text.startswith("Unmixing"))
+        if is_ref_based:
+            self.chem_settings_tabs.setCurrentIndex(1)   # "References" tab
+        else:
+            self.chem_settings_tabs.setCurrentIndex(0)   # "Analysis" tab
+
+    def _sam_refresh_list(self):
+        self.chem_sam_list.clear()
+        colors = self._chem_cluster_colors(max(1, len(self.chem_sam_refs)))
+        for i, ref in enumerate(self.chem_sam_refs):
+            item = QListWidgetItem(self._chem_icon('swatch', QColor.fromRgbF(*colors[i][:3])),
+                                   ref['name'])
+            item.setToolTip(f"{ref['wl'].size} channels, "
+                            f"{ref['wl'].min():.1f}–{ref['wl'].max():.1f} nm")
+            self.chem_sam_list.addItem(item)
+
+    def _sam_add_ref(self, name, wl, sp):
+        wl = np.asarray(wl, dtype=float)
+        sp = np.nan_to_num(np.asarray(sp, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+        if wl.size < 3 or not np.any(sp > 0):
+            QMessageBox.warning(self, "SAM", f"Reference '{name}' is empty or all-zero.")
+            return
+        self.chem_sam_refs.append({'name': str(name), 'wl': wl, 'sp': sp})
+        self._sam_refresh_list()
+
+    def _sam_add_pixel(self):
+        if self.current_spectrum is None or self.current_pixel is None:
+            QMessageBox.information(self, "SAM",
+                "No pixel selected. Pick a pixel in the Data Extraction tab first\n"
+                "(Pixel mode, then click on the map).")
+            return
+        wl = self._get_bands_values()
+        if wl is None or wl.size != np.asarray(self.current_spectrum).size:
+            QMessageBox.warning(self, "SAM", "Pixel spectrum does not match the current band axis.")
+            return
+        y, x = self.current_pixel
+        self._sam_add_ref(f"px ({x},{y})", wl, self.current_spectrum)
+
+    def _sam_add_from_result(self):
+        res = self.chem_result
+        if res is None or res['method'] not in ("K-Means clustering", "NMF"):
+            QMessageBox.information(self, "SAM",
+                "Run K-Means or NMF first — their centroid / component spectra\n"
+                "can then be added as SAM references.\n"
+                "(PCA loadings have negative values and are not usable as endmembers.)")
+            return
+        tag = "K-Means C" if res['method'] == "K-Means clustering" else "NMF "
+        for i in range(res['loadings'].shape[0]):
+            self._sam_add_ref(f"{tag}{i+1}", res['wl'], res['loadings'][i])
+
+    def _sam_load_csv(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Load SAM references (CSV)", "",
+                                              "CSV Files (*.csv);;All Files (*)")
+        if not path:
+            return
+        try:
+            df = pd.read_csv(path)
+            if df.shape[1] < 2:
+                raise ValueError("CSV needs a wavelength column plus at least one spectrum column.")
+            wl = df.iloc[:, 0].to_numpy(dtype=float)
+            for col in df.columns[1:]:
+                self._sam_add_ref(str(col), wl, df[col].to_numpy(dtype=float))
+        except Exception as e:
+            QMessageBox.critical(self, "SAM", f"Could not load references:\n{e}")
+
+    def _sam_remove_selected(self):
+        row = self.chem_sam_list.currentRow()
+        if 0 <= row < len(self.chem_sam_refs):
+            del self.chem_sam_refs[row]
+            self._sam_refresh_list()
+
+    def _sam_clear(self):
+        self.chem_sam_refs = []
+        self._sam_refresh_list()
+
+    def _sam_rename_selected(self):
+        row = self.chem_sam_list.currentRow()
+        if not (0 <= row < len(self.chem_sam_refs)):
+            QMessageBox.information(self, "SAM", "Select a reference to rename first.")
+            return
+        old = self.chem_sam_refs[row]['name']
+        name, ok = QInputDialog.getText(self, "Rename SAM reference", "New name:",
+                                        QLineEdit.Normal, old)
+        name = (name or "").strip()
+        if not ok or not name or name == old:
+            return
+        self.chem_sam_refs[row]['name'] = name
+        self._sam_refresh_list()
+        self.chem_sam_list.setCurrentRow(row)
+
+        # propagate into the current SAM/unmixing result and its UI, if it uses
+        # this reference
+        res = self.chem_result
+        if res is not None \
+                and row < len(res.get('ref_names', [])) and res['ref_names'][row] == old:
+            res['ref_names'][row] = name
+            if res['method'].startswith("SAM"):
+                frac = res.get('cluster_frac')
+                pct = f"  ({100*frac[row]:.1f}% of px)" if frac is not None else ""
+                self.chem_comp_combo.setItemText(row + 1, f"θ {name}{pct}")
+                sym = "θ"
+            elif res['method'].startswith("Unmixing"):
+                mf = res.get('mean_frac')
+                pct = f"  ({100*mf[row]:.1f}% mean)" if mf is not None else ""
+                self.chem_comp_combo.setItemText(row, f"φ {name}{pct}")
+                sym = "φ"
+            else:
+                return
+            for combo in (self.chem_scatter_x_combo, self.chem_scatter_y_combo):
+                if row < combo.count():
+                    combo.setItemText(row, f"{sym} {name}")
+            self._chem_update_map()
+            self._chem_update_loading_plot()
+
+    def _sam_apply_threshold(self, *_):
+        """Re-apply the max-angle cutoff to the existing SAM result (no re-run):
+        recomputes labels/fractions from the stored angle maps."""
+        res = self.chem_result
+        if res is None or not res['method'].startswith("SAM"):
+            return
+        thr = float(self.chem_sam_thresh_spin.value())
+        angles = res['maps']
+        k = angles.shape[1]
+        labels = np.argmin(angles, axis=1)
+        best = angles[np.arange(labels.size), labels]
+        labels[best > thr] = -1
+        res['labels'] = labels
+        res['threshold'] = thr
+        counts = np.bincount(labels[labels >= 0], minlength=k)
+        res['cluster_frac'] = counts / max(1, labels.size)
+
+        for i in range(k):
+            self.chem_comp_combo.setItemText(
+                i + 1, f"θ {res['ref_names'][i]}  ({100*res['cluster_frac'][i]:.1f}% of px)")
+        pct = 100.0 * (labels >= 0).mean()
+        self.chem_status_label.setText(
+            res.get('status_base', "SAM") + f"  |  ≤{thr:g}°: {pct:.1f}% classified")
+        self._chem_update_map()
+
+    def _sam_auto_threshold(self):
+        """Suggest the max-angle cutoff with Otsu's method on the best-angle
+        histogram of the last SAM run, and plot the diagnostics."""
+        res = self.chem_result
+        if res is None or not res['method'].startswith("SAM"):
+            QMessageBox.information(self, "SAM", "Run a SAM analysis first.")
+            return
+        best = np.sort(res['maps'].min(axis=1))
+        n = best.size
+        hi = float(min(90.0, best.max() + 1e-6))
+
+        # Otsu's threshold: split the angle distribution into 'matched' and
+        # 'unmatched' populations by maximizing the between-class variance.
+        hist, edges = np.histogram(best, bins=256, range=(0.0, hi))
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        p = hist.astype(np.float64) / max(1, hist.sum())
+        omega = np.cumsum(p)
+        mu = np.cumsum(p * centers)
+        mu_t = mu[-1]
+        denom = omega * (1.0 - omega)
+        denom[denom <= 0] = np.nan
+        sigma_b = (mu_t * omega - mu) ** 2 / denom
+        if not np.any(np.isfinite(sigma_b)):
+            QMessageBox.warning(self, "SAM", "Could not compute a threshold "
+                                             "(angle distribution is degenerate).")
+            return
+        # With well-separated populations the between-class variance is flat
+        # across the whole valley; take the midpoint of that plateau instead of
+        # its first bin (matches OpenCV's tie-breaking behavior).
+        smax = np.nanmax(sigma_b)
+        plateau = np.where(sigma_b >= smax * (1.0 - 1e-6))[0]
+        thr = float(centers[int(round(0.5 * (plateau[0] + plateau[-1])))])
+        pct_at_thr = 100.0 * np.searchsorted(best, thr, side='right') / n
+
+        # ---- diagnostics in the Silhouette tab ----
+        fig = self.chem_sil_canvas.figure
+        fig.clf()
+        ax1 = fig.add_subplot(211)
+        ax2 = fig.add_subplot(212)
+
+        ax1.hist(best, bins=100, range=(0.0, hi), color='#5dade2', edgecolor='none')
+        ax1.axvline(thr, color='#c0392b', ls='--', lw=1.0)
+        ax1.annotate(f"Otsu: {thr:.1f}°", (thr, ax1.get_ylim()[1] * 0.9),
+                     textcoords="offset points", xytext=(6, 0), fontsize=7, color='#c0392b')
+        ax1.set_xlabel("Best spectral angle per pixel (°)", fontsize=8)
+        ax1.set_ylabel("Pixels", fontsize=8)
+        ax1.set_title("Angle distribution — a valley between 'matched' and 'unmatched' "
+                      "modes is the natural cutoff", fontsize=7)
+        ax1.tick_params(axis='both', which='major', labelsize=6)
+
+        ts = np.linspace(0.0, hi, 300)
+        frac = np.searchsorted(best, ts, side='right') / n
+        ax2.plot(ts, 100.0 * frac, lw=1.0)
+        ax2.plot(thr, pct_at_thr, 'o', ms=6, mfc='none', mec='#c0392b', mew=1.4)
+        ax2.axvline(thr, color='#c0392b', ls='--', lw=0.8)
+        ax2.set_xlabel("Max angle threshold (°)", fontsize=8)
+        ax2.set_ylabel("Classified (%)", fontsize=8)
+        ax2.set_title("Classified fraction vs threshold — plateaus mean the threshold "
+                      "is past a population", fontsize=7)
+        ax2.tick_params(axis='both', which='major', labelsize=6)
+        try:
+            fig.tight_layout(pad=0.8)
+        except Exception:
+            pass
+        self.chem_sil_canvas.draw_idle()
+        self.chem_plot_tabs.setCurrentIndex(2)
+
+        # setting the spin re-applies the classification instantly
+        self.chem_sam_thresh_spin.setValue(round(thr, 1))
+        self.statusBar().showMessage(
+            f"Otsu-suggested max angle: {thr:.1f}° ({pct_at_thr:.1f}% classified)", 4000)
+
+    @staticmethod
+    def _sam_resample(ref_wl, ref_sp, target_wl):
+        """Nearest-wavelength resampling of a reference onto the analysis band axis.
+
+        Returns (values, coverage) where coverage is the fraction of target
+        channels that found a reference channel within tolerance (others are 0)."""
+        order = np.argsort(ref_wl)
+        rw = np.asarray(ref_wl, dtype=float)[order]
+        rs = np.asarray(ref_sp, dtype=float)[order]
+        pos = np.clip(np.searchsorted(rw, target_wl), 1, rw.size - 1)
+        left, right = rw[pos - 1], rw[pos]
+        idx = np.where(np.abs(target_wl - left) <= np.abs(right - target_wl), pos - 1, pos)
+        dist = np.abs(rw[idx] - target_wl)
+        spacing = float(np.median(np.abs(np.diff(rw)))) if rw.size > 1 else 1.0
+        ok = dist <= max(1.5 * spacing, 1e-9)
+        return np.where(ok, rs[idx], 0.0), float(ok.mean())
+
+    def _sam_ref_matrix(self, wl, notes, title):
+        """Resample all stored references onto the analysis band axis.
+
+        Returns (R, names) with R of shape (n_refs, n_bands), or None if a
+        reference has no signal in the selected range (a warning is shown)."""
+        refs = list(self.chem_sam_refs)
+        R = np.empty((len(refs), wl.size), dtype=np.float64)
+        for i, ref in enumerate(refs):
+            R[i], coverage = self._sam_resample(ref['wl'], ref['sp'], wl)
+            if coverage < 0.9:
+                notes.append(f"'{ref['name']}' covers only {100*coverage:.0f}% of the range")
+        r_norm = np.linalg.norm(R, axis=1)
+        if np.any(r_norm <= 0):
+            bad = [refs[i]['name'] for i in np.where(r_norm <= 0)[0]]
+            QMessageBox.warning(self, title,
+                "Reference(s) with no signal in the selected wavelength/spectrometer "
+                f"range: {', '.join(bad)}")
+            return None
+        return R, [r['name'] for r in refs]
+
+    def _sam_run_core(self, prep, _step):
+        """Compute spectral angle maps + classification for the current references."""
+        X = prep['X']; valid = prep['valid']
+        Hh, Ww, wl = prep['H'], prep['W'], prep['wl']
+        n_valid = X.shape[0]
+        refs = list(self.chem_sam_refs)
+        k = len(refs)
+        thr = float(self.chem_sam_thresh_spin.value())
+
+        notes = []
+        if prep.get('spectro_note'):
+            notes.append(prep['spectro_note'])
+
+        if not _step(2, f"Resampling {k} references…"):
+            self.chem_status_label.setText("Analysis cancelled.")
+            return
+
+        rm = self._sam_ref_matrix(wl, notes, "SAM")
+        if rm is None:
+            return
+        R, _names = rm
+        Rn = R / np.linalg.norm(R, axis=1)[:, None]
+
+        if not _step(3, f"Computing spectral angles for {n_valid:,} pixels…"):
+            self.chem_status_label.setText("Analysis cancelled.")
+            return
+
+        Xf = X.astype(np.float64, copy=False)
+        x_norm = np.linalg.norm(Xf, axis=1)
+        x_norm[x_norm <= 0] = 1.0
+        cos = np.clip((Xf / x_norm[:, None]) @ Rn.T, -1.0, 1.0)
+        angles = np.degrees(np.arccos(cos))            # (n_valid, k)
+        labels = np.argmin(angles, axis=1)
+        best = angles[np.arange(n_valid), labels]
+        labels[best > thr] = -1
+
+        counts = np.bincount(labels[labels >= 0], minlength=k)
+        frac = counts / max(1, n_valid)
+        pct_classified = 100.0 * (labels >= 0).mean()
+
+        result = {'method': "SAM (Spectral Angle Mapper)", 'wl': wl, 'H': Hh, 'W': Ww,
+                  'valid': valid, 'maps': angles, 'labels': labels,
+                  'loadings': R, 'ref_names': [r['name'] for r in refs],
+                  'threshold': thr, 'cluster_frac': frac}
+
+        if not _step(4, "Rendering maps and spectra…"):
+            self.chem_status_label.setText("Analysis cancelled.")
+            return
+        self.chem_result = result
+
+        colors = self._chem_cluster_colors(k)
+        swatches = [self._chem_icon('swatch', QColor.fromRgbF(*c[:3])) for c in colors]
+        self.chem_comp_combo.blockSignals(True)
+        self.chem_comp_combo.clear()
+        self.chem_comp_combo.addItem(self._chem_icon('kmeans'), "Classification map")
+        for i, ref in enumerate(refs):
+            self.chem_comp_combo.addItem(swatches[i], f"θ {ref['name']}  ({100*frac[i]:.1f}% of px)")
+        self.chem_comp_combo.setCurrentIndex(0)
+        self.chem_comp_combo.blockSignals(False)
+
+        # scatter selectors: angle maps only (indices align with maps columns)
+        for combo in (self.chem_scatter_x_combo, self.chem_scatter_y_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            for i, ref in enumerate(refs):
+                combo.addItem(swatches[i], f"θ {ref['name']}")
+            combo.blockSignals(False)
+        self.chem_scatter_x_combo.setCurrentIndex(0)
+        self.chem_scatter_y_combo.setCurrentIndex(min(1, k - 1))
+
+        base = (f"SAM: {n_valid:,} px × {wl.size} bands ({wl.min():.1f}–{wl.max():.1f} nm)"
+                f"  |  {k} reference{'s' if k != 1 else ''}")
+        if notes:
+            base += "  |  " + "; ".join(notes)
+        result['status_base'] = base
+        self.chem_status_label.setText(
+            base + f"  |  ≤{thr:g}°: {pct_classified:.1f}% classified")
+
+        self._chem_update_map()
+        self._chem_update_loading_plot()
+        self._chem_update_scatter()
+        self.chem_settings_tabs.setCurrentIndex(2)   # jump to "Results"
+
+    def _unmix_run_core(self, prep, _step, prog):
+        """NNLS linear unmixing: model each pixel spectrum as a non-negative
+        combination of the reference spectra; map abundance fractions + residual.
+
+        The design matrix is the same for every pixel, so the problem is reduced
+        once via the normal equations (Cholesky) and each pixel only needs a tiny
+        k-dimensional NNLS solve."""
+        from scipy.optimize import nnls as _nnls
+        from scipy.linalg import solve_triangular
+
+        X = prep['X']; valid = prep['valid']
+        Hh, Ww, wl = prep['H'], prep['W'], prep['wl']
+        n_valid = X.shape[0]
+        k = len(self.chem_sam_refs)
+
+        notes = []
+        if prep.get('spectro_note'):
+            notes.append(prep['spectro_note'])
+
+        if not _step(2, f"Resampling {k} references…"):
+            self.chem_status_label.setText("Analysis cancelled.")
+            return
+        rm = self._sam_ref_matrix(wl, notes, "Unmixing")
+        if rm is None:
+            return
+        R, names = rm                                   # (k, B)
+
+        if not _step(3, f"Unmixing {n_valid:,} pixels…"):
+            self.chem_status_label.setText("Analysis cancelled.")
+            return
+
+        # Reduce ||R.T x - b||² to the k-dim problem ||L.T x - z||² (same for
+        # every pixel): AtA = L L.T, z = L⁻¹ (R b).
+        Xf = X.astype(np.float64, copy=False)
+        AtA = R @ R.T                                   # (k, k)
+        AtA[np.diag_indices_from(AtA)] += 1e-12 * max(1.0, np.trace(AtA))
+        L = np.linalg.cholesky(AtA)
+        AtB = R @ Xf.T                                  # (k, n_valid)
+        Z = solve_triangular(L, AtB, lower=True)        # (k, n_valid)
+        Ru = L.T
+        btb = np.einsum('ij,ij->i', Xf, Xf)             # ||b||² per pixel
+        ztz = np.einsum('ij,ij->j', Z, Z)
+
+        weights = np.empty((n_valid, k))
+        rn2 = np.empty(n_valid)
+        chunk = 20000
+        for start in range(0, n_valid, chunk):
+            if prog.wasCanceled():
+                self.chem_status_label.setText("Analysis cancelled.")
+                return
+            stop = min(start + chunk, n_valid)
+            for i in range(start, stop):
+                w, rn = _nnls(Ru, Z[:, i])
+                weights[i] = w
+                rn2[i] = rn * rn
+            prog.setLabelText(f"Unmixing {stop:,} / {n_valid:,} pixels…")
+            QApplication.processEvents()
+
+        # abundance fractions (sum-to-one per pixel) + relative residual
+        wsum = weights.sum(axis=1)
+        frac = np.divide(weights, wsum[:, None],
+                         out=np.zeros_like(weights), where=wsum[:, None] > 0)
+        resid2 = np.maximum(0.0, rn2 + (btb - ztz))      # ||R.T x - b||² per pixel
+        resid_rel = np.sqrt(np.divide(resid2, btb, out=np.zeros_like(resid2),
+                                      where=btb > 0))
+        maps = np.column_stack([frac, resid_rel])        # (n_valid, k + 1)
+        mean_frac = frac.mean(axis=0)
+        mean_resid = float(resid_rel.mean())
+
+        result = {'method': "Unmixing (NNLS)", 'wl': wl, 'H': Hh, 'W': Ww,
+                  'valid': valid, 'maps': maps,
+                  'loadings': R, 'ref_names': list(names),
+                  'mean_frac': mean_frac, 'evr': None}
+
+        if not _step(4, "Rendering maps and spectra…"):
+            self.chem_status_label.setText("Analysis cancelled.")
+            return
+        self.chem_result = result
+
+        colors = self._chem_cluster_colors(k)
+        swatches = [self._chem_icon('swatch', QColor.fromRgbF(*c[:3])) for c in colors]
+        gray = self._chem_icon('swatch', QColor('#7f8c8d'))
+        self.chem_comp_combo.blockSignals(True)
+        self.chem_comp_combo.clear()
+        for i, name in enumerate(names):
+            self.chem_comp_combo.addItem(
+                swatches[i], f"φ {name}  ({100*mean_frac[i]:.1f}% mean)")
+        self.chem_comp_combo.addItem(gray, "Residual (unexplained fraction)")
+        self.chem_comp_combo.setCurrentIndex(0)
+        self.chem_comp_combo.blockSignals(False)
+
+        for combo in (self.chem_scatter_x_combo, self.chem_scatter_y_combo):
+            combo.blockSignals(True)
+            combo.clear()
+            for i, name in enumerate(names):
+                combo.addItem(swatches[i], f"φ {name}")
+            combo.addItem(gray, "Residual")
+            combo.blockSignals(False)
+        self.chem_scatter_x_combo.setCurrentIndex(0)
+        self.chem_scatter_y_combo.setCurrentIndex(min(1, k))
+
+        base = (f"Unmixing (NNLS): {n_valid:,} px × {wl.size} bands "
+                f"({wl.min():.1f}–{wl.max():.1f} nm)"
+                f"  |  {k} reference{'s' if k != 1 else ''}"
+                f"  |  mean residual {100*mean_resid:.1f}%")
+        if notes:
+            base += "  |  " + "; ".join(notes)
+        self.chem_status_label.setText(base)
+
+        self._chem_update_map()
+        self._chem_update_loading_plot()
+        self._chem_update_scatter()
+        self.chem_settings_tabs.setCurrentIndex(2)   # jump to "Results"
+
     _CHEM_BTN_STYLE_IDLE = "font-weight:bold; padding:4px;"
     _CHEM_BTN_STYLE_BUSY = ("font-weight:bold; padding:4px; "
                             "background-color:#f39c12; color:white;")
@@ -7214,6 +7776,14 @@ class HypercubeExplorer(QMainWindow):
         k = int(self.chem_ncomp_spin.value())
         max_fit = int(self.chem_max_fit_spin.value())
         standardize = bool(self.chem_standardize_cb.isChecked())
+
+        if (method.startswith("SAM") or method.startswith("Unmixing")) \
+                and not self.chem_sam_refs:
+            QMessageBox.information(self, "Chemometrics",
+                f"{method.split(' ')[0]} needs at least one reference spectrum.\n\n"
+                "Add one in the 'References' tab: the current pixel spectrum,\n"
+                "the centroids/components of a previous K-Means/NMF run, or a CSV file.")
+            return
 
         # Busy indicators: colored Run button + modal progress dialog
         self.chem_run_btn.setEnabled(False)
@@ -7238,6 +7808,16 @@ class HypercubeExplorer(QMainWindow):
         try:
             prep = self._chem_prepare_matrix()
             if prep is None:
+                return
+
+            if method.startswith("SAM"):
+                self._sam_run_core(prep, _step)
+                prog.setValue(5)
+                return
+
+            if method.startswith("Unmixing"):
+                self._unmix_run_core(prep, _step, prog)
+                prog.setValue(5)
                 return
 
             X = prep['X']; valid = prep['valid']
@@ -7372,6 +7952,7 @@ class HypercubeExplorer(QMainWindow):
             self._chem_update_map()
             self._chem_update_loading_plot()
             self._chem_update_scatter()
+            self.chem_settings_tabs.setCurrentIndex(2)   # jump to "Results"
             prog.setValue(5)
         except Exception as e:
             QMessageBox.critical(self, "Chemometrics", f"Analysis failed:\n{e}")
@@ -7401,6 +7982,7 @@ class HypercubeExplorer(QMainWindow):
 
     def _chem_draw_score_map(self, ax, fig, res, i, title_fs=8):
         """Draw one component map on the given axes; returns the colorbar."""
+        is_sam = res['method'].startswith("SAM")
         img = self._chem_score_image(res, i)
         vals = img[np.isfinite(img)]
         if vals.size:
@@ -7413,11 +7995,19 @@ class HypercubeExplorer(QMainWindow):
             # symmetric diverging scale so sign is meaningful
             lim = max(abs(vmin), abs(vmax))
             im = ax.imshow(img, cmap='RdBu_r', vmin=-lim, vmax=lim, interpolation='nearest')
+        elif is_sam:
+            # inverted colormap: bright = small angle = good match
+            im = ax.imshow(img, cmap='viridis_r', vmin=vmin, vmax=vmax, interpolation='nearest')
         else:
             im = ax.imshow(img, cmap='viridis', vmin=vmin, vmax=vmax, interpolation='nearest')
         cbar = fig.colorbar(im, ax=ax, shrink=0.85)
         cbar.ax.tick_params(labelsize=5)
-        ax.set_title(self.chem_comp_combo.itemText(i), fontsize=title_fs)
+        if is_sam:
+            cbar.set_label("angle (°)", fontsize=6)
+        elif res['method'].startswith("Unmixing"):
+            cbar.set_label("fraction", fontsize=6)
+        # SAM's combo has the classification map at index 0, angle maps after it
+        ax.set_title(self.chem_comp_combo.itemText(i + 1 if is_sam else i), fontsize=title_fs)
         ax.tick_params(axis='both', which='major', labelsize=6)
         return cbar
 
@@ -7430,26 +8020,42 @@ class HypercubeExplorer(QMainWindow):
         self.chem_colorbar = None
         self.chem_ax = None
 
+        is_sam = res['method'].startswith("SAM")
         idx = max(0, self.chem_comp_combo.currentIndex())
         Hh, Ww, valid = res['H'], res['W'], res['valid']
+        map_idx = idx - 1 if is_sam else idx   # SAM combo item 0 = classification map
         grid_mode = (self.chem_grid_cb.isChecked()
-                     and res['method'] != "K-Means clustering")
+                     and res['method'] != "K-Means clustering"
+                     and not (is_sam and idx == 0))
 
-        if res['method'] == "K-Means clustering":
+        if res['method'] == "K-Means clustering" or (is_sam and idx == 0):
+            # ---- categorical label map ----
             self.chem_ax = fig.add_subplot(111)
             k = res['loadings'].shape[0]
+            colors = list(self._chem_cluster_colors(k))
+            if is_sam:
+                names = [(n[:10] + '…') if len(n) > 11 else n for n in res['ref_names']]
+                labels = np.where(res['labels'] < 0, k, res['labels']).astype(float)
+                colors.append('#95a5a6')   # gray = unclassified (angle > threshold)
+                names.append("n/a")
+                title = f"SAM classification (best match, ≤ {res['threshold']:g}°)"
+            else:
+                names = [f"C{i+1}" for i in range(k)]
+                labels = res['labels'].astype(float)
+                title = f"Chemical domains (K-Means, k={k})"
+            ncat = len(colors)
             full = np.full(Hh * Ww, np.nan)
-            full[valid] = res['labels']
+            full[valid] = labels
             img = full.reshape(Hh, Ww)
             from matplotlib.colors import ListedColormap
-            cmap = ListedColormap(self._chem_cluster_colors(k))
+            cmap = ListedColormap(colors)
             cmap.set_bad(color='black')
             im = self.chem_ax.imshow(np.ma.masked_invalid(img), cmap=cmap,
-                                     vmin=-0.5, vmax=k - 0.5, interpolation='nearest')
+                                     vmin=-0.5, vmax=ncat - 0.5, interpolation='nearest')
             self.chem_colorbar = fig.colorbar(im, ax=self.chem_ax,
-                                              ticks=range(k), shrink=0.85)
-            self.chem_colorbar.ax.set_yticklabels([f"C{i+1}" for i in range(k)], fontsize=6)
-            self.chem_ax.set_title(f"Chemical domains (K-Means, k={k})", fontsize=8)
+                                              ticks=range(ncat), shrink=0.85)
+            self.chem_colorbar.ax.set_yticklabels(names, fontsize=6)
+            self.chem_ax.set_title(title, fontsize=8)
             self.chem_ax.tick_params(axis='both', which='major', labelsize=6)
             self.chem_canvas.setMinimumHeight(0)
         elif grid_mode:
@@ -7458,10 +8064,11 @@ class HypercubeExplorer(QMainWindow):
             nrows = int(np.ceil(k / ncols))
             for i in range(k):
                 ax = fig.add_subplot(nrows, ncols, i + 1)
-                ax._chem_comp_idx = i  # for click-to-select
+                # combo index this subplot corresponds to (for click-to-select)
+                ax._chem_comp_idx = i + 1 if is_sam else i
                 self._chem_draw_score_map(ax, fig, res, i, title_fs=7)
-                if i == idx:
-                    ax.set_title(self.chem_comp_combo.itemText(i),
+                if i == map_idx:
+                    ax.set_title(self.chem_comp_combo.itemText(ax._chem_comp_idx),
                                  fontsize=7, fontweight='bold', color='#c0392b')
                     for spine in ax.spines.values():
                         spine.set_edgecolor('#c0392b'); spine.set_linewidth(1.5)
@@ -7475,9 +8082,16 @@ class HypercubeExplorer(QMainWindow):
             self.chem_canvas.setMinimumHeight(nrows * row_px)
         else:
             self.chem_ax = fig.add_subplot(111)
-            title = self.chem_comp_combo.currentText() + (
-                " score map" if res['method'] == "PCA" else " abundance map")
-            self._chem_draw_score_map(self.chem_ax, fig, res, idx)
+            if is_sam:
+                title = self.chem_comp_combo.currentText() + " — spectral angle (lower = match)"
+            elif res['method'].startswith("Unmixing"):
+                title = self.chem_comp_combo.currentText()
+                if idx < res['maps'].shape[1] - 1:
+                    title += " — abundance fraction"
+            else:
+                title = self.chem_comp_combo.currentText() + (
+                    " score map" if res['method'] == "PCA" else " abundance map")
+            self._chem_draw_score_map(self.chem_ax, fig, res, map_idx)
             self.chem_ax.set_title(title, fontsize=8)
             self.chem_canvas.setMinimumHeight(0)
 
@@ -7568,7 +8182,31 @@ class HypercubeExplorer(QMainWindow):
         ax = self.chem_plot_ax
         ax.clear()
 
-        if res['method'] == "K-Means clustering":
+        if 'ref_names' in res:   # SAM / NNLS unmixing: reference spectra
+            is_unmix = res['method'].startswith("Unmixing")
+            k = res['loadings'].shape[0]
+            colors = self._chem_cluster_colors(k)
+            names = res['ref_names']
+            # display-normalize each reference for comparability
+            norm = res['loadings'] / np.maximum(res['loadings'].max(axis=1, keepdims=True), 1e-12)
+            # SAM combo item 0 = classification map; unmixing's last item = residual
+            sel = idx if is_unmix else idx - 1
+            if sel < 0 or sel >= k:
+                for i in range(k):
+                    ax.plot(wl, norm[i], color=colors[i], lw=0.9, label=names[i])
+                peaks = []
+                ax.set_title(("Unmixing" if is_unmix else "SAM") +
+                             " reference spectra (max-normalized)", fontsize=8)
+            else:
+                for i in range(k):
+                    if i != sel:
+                        ax.plot(wl, norm[i], color=colors[i], lw=0.7, alpha=0.3)
+                ax.plot(wl, norm[sel], color=colors[sel], lw=1.4, label=names[sel])
+                peaks = self._chem_label_peaks(ax, wl, norm[sel], n_top, two_sided=False)
+                ax.set_title(f"Reference '{names[sel]}' (max-normalized)", fontsize=8)
+            ax.set_ylabel("Intensity (norm.)", fontsize=8)
+            ax.legend(fontsize=6, loc='best')
+        elif res['method'] == "K-Means clustering":
             k = res['loadings'].shape[0]
             colors = self._chem_cluster_colors(k)
             for i in range(k):
@@ -7747,7 +8385,10 @@ class HypercubeExplorer(QMainWindow):
         if not path:
             return
         data = {'Wavelength (nm)': res['wl']}
-        if res['method'] == "K-Means clustering":
+        if 'ref_names' in res:   # SAM / NNLS unmixing: reference spectra
+            for i, name in enumerate(res['ref_names']):
+                data[name] = res['loadings'][i]
+        elif res['method'] == "K-Means clustering":
             for i in range(res['loadings'].shape[0]):
                 data[f"Cluster {i+1} centroid"] = res['loadings'][i]
         else:
